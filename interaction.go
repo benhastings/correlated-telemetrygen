@@ -279,7 +279,11 @@ func (s *simulator) handleCheckout(ctx context.Context, c *clock, req request) c
 		attribute.String("feature_flag.result.reason", "split"),
 	}
 	s.event(ctx, checkout, c.advance(100*time.Microsecond), "feature_flag.evaluation",
-		append(flag, attribute.String("feature_flag.context.id", req.userID))...)
+		append(flag,
+			attribute.String("feature_flag.context.id", req.userID),
+			attribute.String("feature_flag.set.id", "checkout"),
+			attribute.String("feature_flag.version", "42"),
+		)...)
 
 	cacheHit := s.rng.Float64() < 0.8
 	_, cache := checkout.tracer.Start(ctx, "GET", trace.WithSpanKind(trace.SpanKindClient),

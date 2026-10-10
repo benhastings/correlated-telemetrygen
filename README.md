@@ -130,6 +130,60 @@ docker run --rm -e OTEL_EXPORTER_OTLP_ENDPOINT=http://host.docker.internal:4317 
 The exporters read the standard `OTEL_EXPORTER_OTLP_*` variables. They send OTLP gRPC to `localhost:4317`
 by default, and an `http://` endpoint means no TLS.
 
+## Checking the telemetry schema
+
+The conventions above are written down as an [OTel Weaver](https://github.com/open-telemetry/weaver) registry in
+[`model/`](model), which depends on the OpenTelemetry semantic conventions v1.44.0:
+
+- [`model/company.yaml`](model/company.yaml): company attributes, and the attribute groups that say what every
+  resource, log and wide event must carry.
+- [`model/shop.yaml`](model/shop.yaml): the `shop.*` domain attributes.
+- [`model/signals.yaml`](model/signals.yaml): the spans the services emit, and the imported
+  `feature_flag.evaluation` event.
+
+[`.weaver.toml`](.weaver.toml) holds the live-check **matchers**. A span name or a log without an event name doesn't
+say which definition it belongs to, so each matcher pairs samples with a span definition or with strict attribute
+groups. For example, a log with `main=true` from checkout must satisfy `shop.wide_event`, `shop.wide_event.server` and
+`shop.wide_event.checkout`.
+
+[`policies/company.rego`](policies/company.rego) adds rules a requirement level can't express, each reported as a
+violation:
+
+- a wide event's `outcome` must agree with its status code
+- a wide event that did not succeed must be logged at WARN or above, and a successful one below WARN
+- `cpu_ms` can't exceed `duration_ms`
+- the `trace_id` and `span_id` attributes must match the record's trace context
+- `user.email`, `user.full_name` and `user.name` must not be emitted
+
+Weaver applies its default OpenTelemetry policy only when no policy directory is given, so
+[`policies/otel.rego`](policies/otel.rego) is a copy of it.
+
+To check the registry and then the generator's telemetry, with Docker and Go installed:
+
+```bash
+docker run --rm -v "$PWD:/work" -w /work otel/weaver:v0.27.0 registry check -r model
+./scripts/live-check.sh
+```
+
+The script starts Weaver as an OTLP receiver on port 4317, runs the generator against it for 10 seconds with the
+failure modes turned up, and prints a summary of the findings. It exits non-zero if any finding is a violation, and
+writes the full report to `live-check-report/live_check.json`. CI runs both steps.
+
+The run reports some `improvement` and `information` findings. They are expected, and are left visible rather than
+filtered out:
+
+- `not_stable`: most of the attributes used, including all company and domain attributes, have development stability.
+- `missing_namespace`: the company fields `main`, `outcome`, `duration_ms`, `cpu_ms`, `trace_id` and `span_id` have no
+  namespace. Dashboards already query these names, so they are kept.
+- `extends_namespace`: reported only for OpenTelemetry's own attributes, such as `db.system.name`, `service.name` and
+  `user.id`, not for company attributes. With a v2 registry, the default policy's list of known attributes appears
+  to leave out the dependency's attributes.
+- `recommended_attribute_not_present`: the flag evaluation has no `feature_flag.error.message`, because no evaluation
+  fails.
+- `conditionally_required_attribute_not_present`: for example, `error.type` on requests that succeeded.
+- `undefined_enum_variant`: `deployment.environment.name` is `local`, and `error.type` takes values such as
+  `GatewayTimeout` and `40001`, which semconv does not list.
+
 ## Development
 
 ```bash

@@ -1,0 +1,116 @@
+# Weaver configuration for checking the generator's telemetry against the registry in model/.
+# See README.md, "Checking the telemetry schema".
+
+[live-check]
+fail_on = "violation"
+# policies/ holds the company policy and a copy of Weaver's default OpenTelemetry policy.
+advice_policies = "policies"
+
+[live-check.otlp]
+grpc_address = "0.0.0.0"
+grpc_port = 4317
+admin_port = 4320
+inactivity_timeout = 10
+
+# Matchers pair each sample with what it is checked against. Strict groups enforce their
+# requirement levels; permitted groups only allow their attributes.
+
+# Resources.
+[[live-check.matchers]]
+id = "match.resource"
+sample_type = "resource"
+strict_attribute_groups = ["shop.resource"]
+
+[[live-check.matchers]]
+id = "match.resource.k8s"
+sample_type = "resource"
+when = '"service.name" in attributes && attributes["service.name"] in ["checkout", "payments"]'
+strict_attribute_groups = ["shop.resource.k8s"]
+
+[[live-check.matchers]]
+id = "match.resource.browser"
+sample_type = "resource"
+when = '"service.name" in attributes && attributes["service.name"] == "web"'
+strict_attribute_groups = ["shop.resource.browser"]
+
+# Logs. Every log carries its trace context. A wide event (main=true) must carry the company
+# fields and its service's fields; any other log may carry request context.
+[[live-check.matchers]]
+id = "match.log"
+sample_type = "log"
+strict_attribute_groups = ["shop.log"]
+
+[[live-check.matchers]]
+id = "match.log.context"
+sample_type = "log"
+when = '!("main" in attributes) && event_name == ""'
+attribute_groups = ["shop.log.context"]
+
+[[live-check.matchers]]
+id = "match.wide_event.web"
+sample_type = "log"
+when = '''
+"main" in attributes && attributes["main"] == true
+  && resource != null && "service.name" in resource.attributes
+  && resource.attributes["service.name"] == "web"
+'''
+strict_attribute_groups = ["shop.wide_event", "shop.wide_event.web"]
+
+[[live-check.matchers]]
+id = "match.wide_event.checkout"
+sample_type = "log"
+when = '''
+"main" in attributes && attributes["main"] == true
+  && resource != null && "service.name" in resource.attributes
+  && resource.attributes["service.name"] == "checkout"
+'''
+strict_attribute_groups = ["shop.wide_event", "shop.wide_event.server", "shop.wide_event.checkout"]
+
+[[live-check.matchers]]
+id = "match.wide_event.payments"
+sample_type = "log"
+when = '''
+"main" in attributes && attributes["main"] == true
+  && resource != null && "service.name" in resource.attributes
+  && resource.attributes["service.name"] == "payments"
+'''
+strict_attribute_groups = ["shop.wide_event", "shop.wide_event.server", "shop.wide_event.payments"]
+
+# Spans. A server span also carries its wide event's attributes.
+[[live-check.matchers]]
+id = "match.span.click"
+sample_type = "span"
+when = 'kind == "internal" && name == "click"'
+signal = "shop.web.click"
+
+[[live-check.matchers]]
+id = "match.span.fetch"
+sample_type = "span"
+when = '''
+kind == "client" && resource != null && "service.name" in resource.attributes
+  && resource.attributes["service.name"] == "web"
+'''
+signal = "shop.web.fetch"
+
+[[live-check.matchers]]
+id = "match.span.server"
+sample_type = "span"
+when = 'kind == "server"'
+signal = "shop.http.server"
+attribute_groups = ["shop.wide_event", "shop.wide_event.server", "shop.wide_event.checkout", "shop.wide_event.payments"]
+
+[[live-check.matchers]]
+id = "match.span.db"
+sample_type = "span"
+when = 'kind == "client" && "db.system.name" in attributes'
+signal = "shop.db.client"
+
+[[live-check.matchers]]
+id = "match.span.http_client"
+sample_type = "span"
+when = '''
+kind == "client" && "http.request.method" in attributes
+  && resource != null && "service.name" in resource.attributes
+  && resource.attributes["service.name"] != "web"
+'''
+signal = "shop.http.client"
