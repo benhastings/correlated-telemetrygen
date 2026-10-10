@@ -40,6 +40,7 @@ var version = "dev"
 func main() {
 	rate := flag.Float64("rate", 2, "checkout requests per second")
 	errorRatio := flag.Float64("error-ratio", 0.25, "fraction of payments that time out at the gateway")
+	dbErrorRatio := flag.Float64("db-error-ratio", 0.02, "fraction of orders that fail with a database serialization failure")
 	environment := flag.String("environment", "local", "deployment.environment.name on every resource")
 	namespace := flag.String("namespace", "shop", "service.namespace and k8s.namespace.name on every resource")
 	region := flag.String("region", "us-east-1", "cloud.region of the simulated cluster")
@@ -52,8 +53,8 @@ func main() {
 		fmt.Println(version)
 		return
 	}
-	if *rate <= 0 || *errorRatio < 0 || *errorRatio > 1 {
-		log.Fatal("--rate must be positive and --error-ratio between 0 and 1")
+	if *rate <= 0 || *errorRatio < 0 || *errorRatio > 1 || *dbErrorRatio < 0 || *dbErrorRatio > 1 {
+		log.Fatal("--rate must be positive, and --error-ratio and --db-error-ratio between 0 and 1")
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -87,10 +88,11 @@ func main() {
 		newFleet(browserResources(d)),
 		newFleet(replicaResources(checkoutIdentity, d, rng)),
 		newFleet(replicaResources(paymentsIdentity, d, rng)),
-		simConfig{namespace: *namespace, errorRatio: *errorRatio}, rng,
+		simConfig{namespace: *namespace, region: *region, errorRatio: *errorRatio, dbErrorRatio: *dbErrorRatio}, rng,
 	)
 
-	log.Printf("correlated-telemetrygen %s: %.2g checkout requests/s, %.0f%% payment errors", version, *rate, *errorRatio*100)
+	log.Printf("correlated-telemetrygen %s: %.2g checkout requests/s, %.0f%% payment errors, %.0f%% database errors",
+		version, *rate, *errorRatio*100, *dbErrorRatio*100)
 	ticker := time.NewTicker(time.Duration(float64(time.Second) / *rate))
 	defer ticker.Stop()
 	sent := 0
