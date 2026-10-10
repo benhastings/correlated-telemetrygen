@@ -161,9 +161,18 @@ func TestEachServiceEmitsOneWideEventPerRequest(t *testing.T) {
 		}
 		svc := serviceOf(rec.Resource())
 		perService[svc]++
-		keys := []string{"http.response.status_code", "duration_ms", "user.id", "user.team.id", "session.id", "outcome"}
-		if svc != "web" {
-			keys = append(keys, "http.route", "db.query_count", "cache.hit")
+		keys := []string{"http.response.status_code", "duration_ms", "cpu_ms", "user.id", "user.team.id", "user.team.plan",
+			"session.id", "outcome", "shop.order.id"}
+		switch svc {
+		case "checkout":
+			keys = append(keys, "http.route", "db.query_count", "cache.hit", "shop.cart.item_count", "shop.order.amount",
+				"shop.order.currency", "shop.payment.method", "feature_flag.key", "feature_flag.result.variant",
+				"feature_flag.provider.name", "feature_flag.result.reason")
+		case "payments":
+			keys = append(keys, "http.route", "db.query_count", "cache.hit", "shop.payment.provider", "shop.payment.method",
+				"shop.payment.amount", "shop.payment.currency")
+		case "web":
+			keys = append(keys, "shop.cart.item_count", "shop.order.amount")
 		}
 		for _, key := range keys {
 			if _, ok := attr(rec, key); !ok {
@@ -490,5 +499,89 @@ func TestDatabaseFailuresFailTheOrderBeforePayment(t *testing.T) {
 			t.Fatalf("%s wide event of a failed order: outcome=%s status=%d error.type=%s",
 				serviceOf(rec.Resource()), outcome.AsString(), status.AsInt64(), errorType.AsString())
 		}
+	}
+}
+
+func TestDomainAttributesAreNamespaced(t *testing.T) {
+	spans, logs := simulate(t, 100, testConfig)
+	check := func(where string, key attribute.Key) {
+		for _, prefix := range []string{"cart.", "payment.", "order."} {
+			if strings.HasPrefix(string(key), prefix) {
+				t.Fatalf("%s has un-namespaced domain attribute %s; use shop.%s", where, key, key)
+			}
+		}
+	}
+	for _, s := range spans {
+		for _, kv := range s.Attributes() {
+			check("span "+s.Name(), kv.Key)
+		}
+	}
+	for _, rec := range logs {
+		rec.WalkAttributes(func(kv attribute.KeyValue) bool {
+			check("log "+rec.Body().AsString(), kv.Key)
+			return true
+		})
+	}
+}
+
+func TestOneOrderIDPerRequestAcrossServices(t *testing.T) {
+	_, logs := simulate(t, 100, testConfig)
+	orders := map[trace.TraceID]string{}
+	owners := map[string]trace.TraceID{}
+	for _, rec := range logs {
+		id, ok := attr(rec, "shop.order.id")
+		if !ok {
+			continue
+		}
+		if prev, seen := orders[rec.TraceID()]; seen && prev != id.AsString() {
+			t.Fatalf("one request has order IDs %s and %s", prev, id.AsString())
+		}
+		if prev, seen := owners[id.AsString()]; seen && prev != rec.TraceID() {
+			t.Fatalf("order %s appears in two requests", id.AsString())
+		}
+		orders[rec.TraceID()], owners[id.AsString()] = id.AsString(), rec.TraceID()
+	}
+}
+
+func TestNewCheckoutFlowIsEvaluatedPerUserAndCostsAQuery(t *testing.T) {
+	spans, logs := simulate(t, 300, testConfig)
+	variants := map[trace.TraceID]string{}
+	perUser := map[string]string{}
+	for _, rec := range logs {
+		if rec.EventName() != "feature_flag.evaluation" {
+			continue
+		}
+		key, _ := attr(rec, "feature_flag.key")
+		variant, _ := attr(rec, "feature_flag.result.variant")
+		user, _ := attr(rec, "feature_flag.context.id")
+		if key.AsString() != newCheckoutFlow {
+			t.Fatalf("evaluated flag %q", key.AsString())
+		}
+		if prev, ok := perUser[user.AsString()]; ok && prev != variant.AsString() {
+			t.Fatalf("user %s got variants %s and %s", user.AsString(), prev, variant.AsString())
+		}
+		perUser[user.AsString()] = variant.AsString()
+		variants[rec.TraceID()] = variant.AsString()
+	}
+	if len(variants) != 300 {
+		t.Fatalf("got %d flag evaluations for 300 checkouts", len(variants))
+	}
+	locationQueries := map[trace.TraceID]bool{}
+	for _, s := range spans {
+		if s.Name() == "SELECT shop.inventory_locations" {
+			locationQueries[s.SpanContext().TraceID()] = true
+		}
+	}
+	treatment := 0
+	for traceID, variant := range variants {
+		if (variant == "treatment") != locationQueries[traceID] {
+			t.Fatalf("a %s checkout ran the per-warehouse query: %v", variant, locationQueries[traceID])
+		}
+		if variant == "treatment" {
+			treatment++
+		}
+	}
+	if ratio := float64(treatment) / 300; ratio < 0.2 || ratio > 0.4 {
+		t.Fatalf("treatment ratio %.2f, want about 0.3", ratio)
 	}
 }
