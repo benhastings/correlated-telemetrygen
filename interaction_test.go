@@ -35,14 +35,14 @@ func (r *logRecorder) OnEmit(_ context.Context, rec *sdklog.Record) error {
 
 var testDeployment = deployment{environment: "test", namespace: "shop", region: "us-east-1"}
 
-func recordingFleet(t *testing.T, resources [][]attribute.KeyValue, spans *tracetest.SpanRecorder, logs *logRecorder) []instance {
+func recordingFleet(t *testing.T, replicas []replica, spans *tracetest.SpanRecorder, logs *logRecorder) []instance {
 	t.Helper()
 	var fleet []instance
-	for _, attrs := range resources {
-		res := resource.NewSchemaless(attrs...)
+	for _, r := range replicas {
+		res := resource.NewSchemaless(r.resource...)
 		tp := sdktrace.NewTracerProvider(sdktrace.WithResource(res), sdktrace.WithSpanProcessor(spans))
 		lp := sdklog.NewLoggerProvider(sdklog.WithResource(res), sdklog.WithProcessor(logs))
-		fleet = append(fleet, instance{tracer: tp.Tracer(scope), logger: lp.Logger(scope)})
+		fleet = append(fleet, instance{tracer: tp.Tracer(scope), logger: lp.Logger(scope), podIP: r.podIP})
 	}
 	return fleet
 }
@@ -56,7 +56,7 @@ func simulate(t *testing.T, n int, errorRatio float64) ([]sdktrace.ReadOnlySpan,
 		recordingFleet(t, browserResources(testDeployment), spans, logs),
 		recordingFleet(t, replicaResources(checkoutIdentity, testDeployment, rng), spans, logs),
 		recordingFleet(t, replicaResources(paymentsIdentity, testDeployment, rng), spans, logs),
-		errorRatio, rng,
+		simConfig{namespace: testDeployment.namespace, errorRatio: errorRatio}, rng,
 	)
 	start := time.Unix(1_700_000_000, 0)
 	for i := range n {
@@ -232,8 +232,8 @@ func TestWideEventsOfOneRequestShareTheSessionAndUser(t *testing.T) {
 }
 
 func TestBrowserResourcesDescribeTheBrowserNotTheServer(t *testing.T) {
-	for _, attrs := range browserResources(testDeployment) {
-		res := resource.NewSchemaless(attrs...)
+	for _, r := range browserResources(testDeployment) {
+		res := resource.NewSchemaless(r.resource...)
 		if got := resourceAttr(res, "telemetry.sdk.language"); got != "webjs" {
 			t.Fatalf("web telemetry.sdk.language = %q, want webjs", got)
 		}
@@ -259,8 +259,8 @@ func TestPaymentErrorsStayOutOfCheckoutsServerSpan(t *testing.T) {
 		}
 		switch serviceOf(s.Resource()) {
 		case "checkout":
-			if s.Status().Code == codes.Error {
-				t.Fatal("a checkout server span has error status")
+			if s.Status().Code != codes.Unset {
+				t.Fatalf("a checkout server span has status %s, want unset", s.Status().Code)
 			}
 		case "payments":
 			payments++
@@ -282,8 +282,8 @@ func TestReplicasAreDistinctPodsSpreadAcrossZones(t *testing.T) {
 			t.Fatalf("%s has %d replicas, want %d", id.name, len(replicas), id.replicas)
 		}
 		seen := map[string]map[string]bool{}
-		for _, attrs := range replicas {
-			res := resource.NewSchemaless(attrs...)
+		for _, r := range replicas {
+			res := resource.NewSchemaless(r.resource...)
 			for _, key := range []attribute.Key{
 				"service.instance.id", "service.criticality", "cloud.provider", "cloud.platform", "cloud.account.id",
 				"cloud.region", "cloud.availability_zone", "k8s.cluster.name", "k8s.namespace.name", "k8s.deployment.name",
@@ -337,5 +337,81 @@ func TestRequestsSpreadAcrossReplicasAndStayOnOne(t *testing.T) {
 		if len(perService[svc]) != replicas {
 			t.Fatalf("%s requests were served by %d instances, want %d", svc, len(perService[svc]), replicas)
 		}
+	}
+}
+
+func spanAttr(s sdktrace.ReadOnlySpan, key attribute.Key) (attribute.Value, bool) {
+	for _, kv := range s.Attributes() {
+		if kv.Key == key {
+			return kv.Value, true
+		}
+	}
+	return attribute.Value{}, false
+}
+
+func TestHTTPSpansHaveTheAttributesSemconvRequires(t *testing.T) {
+	spans, _ := simulate(t, 100, 0.25)
+	clients := 0
+	for _, s := range spans {
+		if _, ok := spanAttr(s, "peer.service"); ok {
+			t.Fatalf("span %q uses the deprecated peer.service", s.Name())
+		}
+		if _, ok := spanAttr(s, "http.request.method"); !ok {
+			continue
+		}
+		var required []attribute.Key
+		switch s.SpanKind() {
+		case trace.SpanKindServer:
+			required = []attribute.Key{"url.path", "url.scheme", "http.response.status_code"}
+		case trace.SpanKindClient:
+			clients++
+			required = []attribute.Key{"server.address", "server.port", "url.full"}
+		default:
+			t.Fatalf("%s span %q has http.request.method", s.SpanKind(), s.Name())
+		}
+		for _, key := range required {
+			if _, ok := spanAttr(s, key); !ok {
+				t.Fatalf("%s %s span %q is missing %s", serviceOf(s.Resource()), s.SpanKind(), s.Name(), key)
+			}
+		}
+	}
+	if clients != 300 {
+		t.Fatalf("got %d HTTP client spans, want 300 (browser, checkout and payments, one each per request)", clients)
+	}
+}
+
+func TestPeerAddressesIdentifyTheReplicaOnTheOtherEnd(t *testing.T) {
+	spans, _ := simulate(t, 100, 0.25)
+	byID := map[trace.SpanID]sdktrace.ReadOnlySpan{}
+	for _, s := range spans {
+		byID[s.SpanContext().SpanID()] = s
+	}
+	// Each address must belong to exactly one pod, and each pod must have exactly one address.
+	addrToPod, podToAddr := map[string]string{}, map[string]string{}
+	pair := func(addr attribute.Value, pod string) {
+		a := addr.AsString()
+		if a == "" {
+			t.Fatalf("no address recorded for pod %s", pod)
+		}
+		if prev, ok := addrToPod[a]; ok && prev != pod {
+			t.Fatalf("address %s belongs to pods %s and %s", a, prev, pod)
+		}
+		if prev, ok := podToAddr[pod]; ok && prev != a {
+			t.Fatalf("pod %s has addresses %s and %s", pod, prev, a)
+		}
+		addrToPod[a], podToAddr[pod] = pod, a
+	}
+	for _, srv := range spans {
+		if serviceOf(srv.Resource()) != "payments" || srv.SpanKind() != trace.SpanKindServer {
+			continue
+		}
+		call := byID[srv.Parent().SpanID()]
+		peer, _ := spanAttr(call, "network.peer.address")
+		pair(peer, resourceAttr(srv.Resource(), "k8s.pod.name"))
+		client, _ := spanAttr(srv, "client.address")
+		pair(client, resourceAttr(call.Resource(), "k8s.pod.name"))
+	}
+	if len(podToAddr) != checkoutIdentity.replicas+paymentsIdentity.replicas {
+		t.Fatalf("saw addresses for %d pods, want %d", len(podToAddr), checkoutIdentity.replicas+paymentsIdentity.replicas)
 	}
 }

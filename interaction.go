@@ -18,21 +18,27 @@ import (
 type instance struct {
 	tracer trace.Tracer
 	logger otellog.Logger
+	podIP  string // empty for a browser
 }
 
 // simulator emits one checkout interaction at a time. Time is simulated: spans and logs get
 // explicit timestamps laid out from the start of the interaction, so nothing sleeps.
 type simulator struct {
-	web        []instance // one per browser profile
-	checkout   []instance
-	payments   []instance
-	errorRatio float64
-	rng        *rand.Rand
-	sessions   map[string]*session
+	simConfig
+	web      []instance // one per browser profile
+	checkout []instance
+	payments []instance
+	rng      *rand.Rand
+	sessions map[string]*session
 }
 
-func newSimulator(web, checkout, payments []instance, errorRatio float64, rng *rand.Rand) *simulator {
-	return &simulator{web: web, checkout: checkout, payments: payments, errorRatio: errorRatio, rng: rng, sessions: map[string]*session{}}
+type simConfig struct {
+	namespace  string  // the Kubernetes namespace the services run in
+	errorRatio float64 // fraction of charges that time out at the payment gateway
+}
+
+func newSimulator(web, checkout, payments []instance, cfg simConfig, rng *rand.Rand) *simulator {
+	return &simulator{simConfig: cfg, web: web, checkout: checkout, payments: payments, rng: rng, sessions: map[string]*session{}}
 }
 
 var tenants = []string{"enterprise_corp_a", "enterprise_corp_b", "smb_north", "smb_south", "free_tier"}
@@ -43,7 +49,8 @@ const users = 500
 // checkout to payments, in W3C Baggage, so every wide event in a request carries it.
 type session struct {
 	id, previousID string
-	browser        int // index into browserProfiles and simulator.web
+	browser        int    // index into browserProfiles and simulator.web
+	ip             string // the shopper's public address
 }
 
 // request is one checkout by one shopper.
@@ -61,13 +68,22 @@ func (s *simulator) newRequest() request {
 	sess, ok := s.sessions[userID]
 	switch {
 	case !ok:
-		sess = &session{id: uuidV4(s.rng), browser: s.rng.IntN(len(s.web))}
+		sess = &session{id: uuidV4(s.rng), browser: s.rng.IntN(len(s.web)), ip: publicIP(s.rng)}
 		s.sessions[userID] = sess
 	case s.rng.Float64() < 0.05:
 		sess.previousID, sess.id = sess.id, uuidV4(s.rng)
 	}
 	return request{userID: userID, tenant: tenants[n%len(tenants)], session: sess, items: 1 + s.rng.IntN(5)}
 }
+
+// publicIP returns an address from the IPv4 ranges reserved for documentation (RFC 5737).
+func publicIP(rng *rand.Rand) string {
+	nets := []string{"192.0.2", "198.51.100", "203.0.113"}
+	return fmt.Sprintf("%s.%d", nets[rng.IntN(len(nets))], 1+rng.IntN(254))
+}
+
+// loadBalancerIPs are the addresses of the load balancer nodes in front of checkout, one per zone.
+var loadBalancerIPs = []string{"10.0.4.17", "10.0.37.201", "10.0.70.88"}
 
 // sessionAttrs are the session attributes the browser records.
 func (r request) sessionAttrs() []attribute.KeyValue {
@@ -162,15 +178,26 @@ func (s *simulator) run(ctx context.Context, start time.Time) {
 func (s *simulator) handleCheckout(ctx context.Context, c *clock, req request) checkoutResult {
 	checkout := s.pick(s.checkout)
 	start := c.now
+	// The load balancer terminates TLS and forwards over HTTP/1.1. The shopper's address and the
+	// original scheme come from X-Forwarded-For and X-Forwarded-Proto.
+	requestAttrs := []attribute.KeyValue{
+		attribute.String("http.request.method", "POST"),
+		attribute.String("http.route", "/api/v1/checkout"),
+		attribute.String("url.path", "/api/v1/checkout"),
+		attribute.String("url.scheme", "https"),
+		attribute.String("server.address", "shop.example.com"),
+		attribute.Int("server.port", 443),
+		attribute.String("client.address", req.session.ip),
+		attribute.String("network.peer.address", loadBalancerIPs[s.rng.IntN(len(loadBalancerIPs))]),
+		attribute.String("network.protocol.version", "1.1"),
+		attribute.String("user_agent.original", browserProfiles[req.session.browser].userAgent),
+		attribute.Int("http.request.body.size", 120+90*req.items),
+		attribute.String("user.id", req.userID),
+		attribute.String("user.team.id", req.tenant),
+		attribute.String("session.id", req.session.id),
+	}
 	ctx, root := checkout.tracer.Start(ctx, "POST /api/v1/checkout",
-		trace.WithSpanKind(trace.SpanKindServer), trace.WithTimestamp(start),
-		trace.WithAttributes(
-			attribute.String("http.request.method", "POST"),
-			attribute.String("http.route", "/api/v1/checkout"),
-			attribute.String("user.id", req.userID),
-			attribute.String("user.team.id", req.tenant),
-			attribute.String("session.id", req.session.id),
-		))
+		trace.WithSpanKind(trace.SpanKindServer), trace.WithTimestamp(start), trace.WithAttributes(requestAttrs...))
 	s.log(ctx, checkout, c.advance(time.Millisecond), otellog.SeverityInfo, "checkout started",
 		attribute.String("user.id", req.userID), attribute.Int("cart.items", req.items))
 
@@ -212,27 +239,34 @@ func (s *simulator) handleCheckout(ctx context.Context, c *clock, req request) c
 		outcome, status, severity, body = "payment_pending", 202, otellog.SeverityWarn, "checkout accepted with payment pending"
 	}
 	end := c.advance(s.between(time.Millisecond, 4*time.Millisecond))
-	wide := []attribute.KeyValue{
-		attribute.String("http.request.method", "POST"),
-		attribute.String("http.route", "/api/v1/checkout"),
+	wide := append(requestAttrs,
 		attribute.Int("http.response.status_code", status),
+		attribute.Int("http.response.body.size", 280+s.rng.IntN(40)),
 		attribute.Float64("duration_ms", millis(end.Sub(start))),
-		attribute.String("user.id", req.userID),
-		attribute.String("user.team.id", req.tenant),
-		attribute.String("session.id", req.session.id),
 		attribute.Int("db.query_count", queries),
 		attribute.Float64("db.duration_ms", millis(dbTime)),
 		attribute.Bool("cache.hit", cacheHit),
 		attribute.String("outcome", outcome),
-	}
+	)
 	if errorType != "" {
 		wide = append(wide, attribute.String("error.type", errorType))
 	}
+	// Server span status stays unset below 500: a 202 is a success for checkout.
 	root.SetAttributes(wide...)
-	root.SetStatus(codes.Ok, "")
 	s.log(ctx, checkout, end, severity, body, append(wide, attribute.Bool("main", true))...)
 	root.End(trace.WithTimestamp(end))
 	return checkoutResult{status: status, outcome: outcome, errorType: errorType}
+}
+
+// paymentProvider is an external payment API that payments charges cards through.
+type paymentProvider struct {
+	name, host, path string
+}
+
+var paymentProviders = []paymentProvider{
+	{name: "stripe", host: "api.stripe.com", path: "/v1/charges"},
+	{name: "adyen", host: "checkout-live.adyen.com", path: "/v71/payments"},
+	{name: "braintree", host: "payments.braintree-api.com", path: "/graphql"},
 }
 
 // charge is checkout's call to payments: a client span in checkout and, under it, the
@@ -241,33 +275,52 @@ func (s *simulator) handleCheckout(ctx context.Context, c *clock, req request) c
 func (s *simulator) charge(ctx context.Context, checkout instance, c *clock, req request) (bool, string) {
 	fail := s.rng.Float64() < s.errorRatio
 	payments := s.pick(s.payments)
-	ctx, call := checkout.tracer.Start(ctx, "POST", trace.WithSpanKind(trace.SpanKindClient),
+	ctx, call := checkout.tracer.Start(ctx, "POST /api/v1/charge", trace.WithSpanKind(trace.SpanKindClient),
 		trace.WithTimestamp(c.now), trace.WithAttributes(
 			attribute.String("http.request.method", "POST"),
 			attribute.String("server.address", "payments"),
 			attribute.Int("server.port", 8080),
 			attribute.String("url.full", "http://payments:8080/api/v1/charge"),
+			attribute.String("url.template", "/api/v1/charge"),
+			attribute.String("network.peer.address", payments.podIP),
+			attribute.Int("network.peer.port", 8080),
+			attribute.String("network.protocol.version", "1.1"),
+			attribute.String("service.peer.name", "payments"),
+			attribute.String("service.peer.namespace", s.namespace),
 		))
 	start := c.advance(time.Millisecond)
 
+	requestAttrs := []attribute.KeyValue{
+		attribute.String("http.request.method", "POST"),
+		attribute.String("http.route", "/api/v1/charge"),
+		attribute.String("url.path", "/api/v1/charge"),
+		attribute.String("url.scheme", "http"),
+		attribute.String("server.address", "payments"),
+		attribute.Int("server.port", 8080),
+		attribute.String("client.address", checkout.podIP),
+		attribute.String("network.peer.address", checkout.podIP),
+		attribute.String("network.protocol.version", "1.1"),
+		attribute.String("user_agent.original", "Go-http-client/1.1"),
+		attribute.Int("http.request.body.size", 150+s.rng.IntN(30)),
+		attribute.String("user.id", req.userID),
+		attribute.String("user.team.id", req.tenant),
+		attribute.String("session.id", req.session.id),
+	}
 	pctx, srv := payments.tracer.Start(ctx, "POST /api/v1/charge",
-		trace.WithSpanKind(trace.SpanKindServer), trace.WithTimestamp(start),
-		trace.WithAttributes(
-			attribute.String("http.request.method", "POST"),
-			attribute.String("http.route", "/api/v1/charge"),
-			attribute.String("user.id", req.userID),
-			attribute.String("user.team.id", req.tenant),
-			attribute.String("session.id", req.session.id),
-		))
+		trace.WithSpanKind(trace.SpanKindServer), trace.WithTimestamp(start), trace.WithAttributes(requestAttrs...))
 	amount := float64(req.items) * (5 + float64(s.rng.IntN(9500))/100)
 	s.log(pctx, payments, c.advance(time.Millisecond), otellog.SeverityInfo, "authorizing card",
 		attribute.Float64("payment.amount", amount), attribute.String("payment.currency", "USD"))
 
-	_, gw := payments.tracer.Start(pctx, "POST", trace.WithSpanKind(trace.SpanKindClient),
+	provider := paymentProviders[s.rng.IntN(len(paymentProviders))]
+	_, gw := payments.tracer.Start(pctx, "POST "+provider.path, trace.WithSpanKind(trace.SpanKindClient),
 		trace.WithTimestamp(c.now), trace.WithAttributes(
 			attribute.String("http.request.method", "POST"),
-			attribute.String("server.address", "gateway.example.com"),
+			attribute.String("server.address", provider.host),
 			attribute.Int("server.port", 443),
+			attribute.String("url.full", "https://"+provider.host+provider.path),
+			attribute.String("url.template", provider.path),
+			attribute.String("network.protocol.version", "2"),
 		))
 	status, outcome, errorType := 200, "success", ""
 	if fail {
@@ -279,22 +332,19 @@ func (s *simulator) charge(ctx context.Context, checkout instance, c *clock, req
 		s.log(pctx, payments, c.advance(time.Millisecond), otellog.SeverityError, "payment gateway timed out",
 			attribute.String("error.type", errorType), attribute.Float64("payment.amount", amount))
 	} else {
+		gw.SetAttributes(attribute.Int("http.response.status_code", 200))
 		gw.End(trace.WithTimestamp(c.advance(s.between(30*time.Millisecond, 110*time.Millisecond))))
 	}
 
 	end := c.advance(s.between(time.Millisecond, 3*time.Millisecond))
-	wide := []attribute.KeyValue{
-		attribute.String("http.request.method", "POST"),
-		attribute.String("http.route", "/api/v1/charge"),
+	wide := append(requestAttrs,
 		attribute.Int("http.response.status_code", status),
+		attribute.Int("http.response.body.size", 90+s.rng.IntN(20)),
 		attribute.Float64("duration_ms", millis(end.Sub(start))),
-		attribute.String("user.id", req.userID),
-		attribute.String("user.team.id", req.tenant),
-		attribute.String("session.id", req.session.id),
 		attribute.Int("db.query_count", 0),
 		attribute.Bool("cache.hit", false),
 		attribute.String("outcome", outcome),
-	}
+	)
 	severity, body := otellog.SeverityInfo, "charge completed"
 	if fail {
 		wide = append(wide, attribute.String("error.type", errorType))
