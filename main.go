@@ -2,8 +2,8 @@
 // record belongs to a span of the same request, so a backend can navigate from a log line to
 // its trace and from a span to its logs.
 //
-// It simulates a checkout service that calls a payments service, each running as several
-// replicas in a Kubernetes cluster. The OTLP endpoint comes from the standard
+// It simulates shoppers whose browsers call a checkout service, which calls a payments
+// service; the services run as several replicas in a Kubernetes cluster. The OTLP endpoint comes from the standard
 // OTEL_EXPORTER_OTLP_* environment variables, and OTEL_RESOURCE_ATTRIBUTES overrides or adds
 // to the simulated resource attributes.
 package main
@@ -23,12 +23,17 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploggrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	otellog "go.opentelemetry.io/otel/log"
 	sdklog "go.opentelemetry.io/otel/sdk/log"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/trace"
 )
 
 const scope = "github.com/brandonapol/correlated-telemetrygen"
+
+// schemaURL is the semantic conventions version the generated telemetry follows.
+const schemaURL = "https://opentelemetry.io/schemas/1.44.0"
 
 // version is set at build time with -ldflags "-X main.version=...".
 var version = "dev"
@@ -67,24 +72,24 @@ func main() {
 	d := deployment{environment: *environment, namespace: *namespace, region: *region}
 
 	var shutdowns []func(context.Context) error
-	newFleet := func(id serviceIdentity) []instance {
+	newFleet := func(resources [][]attribute.KeyValue) []instance {
 		var fleet []instance
-		for _, attrs := range replicaResources(id, d, rng) {
+		for _, attrs := range resources {
 			inst, shutdown, err := newOTLPInstance(ctx, attrs)
 			if err != nil {
-				log.Fatalf("setting up %s: %v", id.name, err)
+				log.Fatalf("setting up telemetry: %v", err)
 			}
 			shutdowns = append(shutdowns, shutdown)
 			fleet = append(fleet, inst)
 		}
 		return fleet
 	}
-	sim := &simulator{
-		checkout:   newFleet(checkoutIdentity),
-		payments:   newFleet(paymentsIdentity),
-		errorRatio: *errorRatio,
-		rng:        rng,
-	}
+	sim := newSimulator(
+		newFleet(browserResources(d)),
+		newFleet(replicaResources(checkoutIdentity, d, rng)),
+		newFleet(replicaResources(paymentsIdentity, d, rng)),
+		*errorRatio, rng,
+	)
 
 	log.Printf("correlated-telemetrygen %s: %.2g checkout requests/s, %.0f%% payment errors", version, *rate, *errorRatio*100)
 	ticker := time.NewTicker(time.Duration(float64(time.Second) / *rate))
@@ -114,10 +119,12 @@ loop:
 }
 
 // newOTLPInstance builds a tracer and a logger that share one resource and export over OTLP
-// gRPC. OTEL_RESOURCE_ATTRIBUTES is applied last, so it overrides the simulated attributes.
+// gRPC. The resource attributes include telemetry.sdk.*, because the web front end reports the
+// browser SDK rather than this one. OTEL_RESOURCE_ATTRIBUTES is applied last, so it overrides
+// the simulated attributes.
 func newOTLPInstance(ctx context.Context, attrs []attribute.KeyValue) (instance, func(context.Context) error, error) {
 	res, err := resource.New(ctx,
-		resource.WithTelemetrySDK(),
+		resource.WithSchemaURL(schemaURL),
 		resource.WithAttributes(attrs...),
 		resource.WithFromEnv(),
 	)
@@ -139,5 +146,8 @@ func newOTLPInstance(ctx context.Context, attrs []attribute.KeyValue) (instance,
 	shutdown := func(ctx context.Context) error {
 		return errors.Join(tp.Shutdown(ctx), lp.Shutdown(ctx))
 	}
-	return instance{tracer: tp.Tracer(scope), logger: lp.Logger(scope)}, shutdown, nil
+	return instance{
+		tracer: tp.Tracer(scope, trace.WithSchemaURL(schemaURL)),
+		logger: lp.Logger(scope, otellog.WithSchemaURL(schemaURL)),
+	}, shutdown, nil
 }

@@ -8,27 +8,40 @@ can't do this: its `logs` command takes one fixed `--trace-id`, and its `traces`
 
 ## What it sends
 
-Each interaction is one `POST /api/v1/checkout` on the `checkout` service, which calls `payments`:
+Each interaction is a shopper clicking "place order" in the `web` front end, which sends
+`POST /api/v1/checkout` to the `checkout` service, which calls `payments`:
 
 ```text
-checkout  SERVER  POST /api/v1/checkout          log: checkout started
-checkout  CLIENT    GET cart                     (redis, cache.hit)
-checkout  CLIENT    SELECT shop.inventory ...    (postgresql, 2–5 queries)
-checkout  CLIENT    POST  -> payments
-payments  SERVER      POST /api/v1/charge        log: authorizing card
-payments  CLIENT        POST  -> gateway         log: payment gateway timed out (on error)
-                                                 log: charge completed / charge failed   (wide event)
-                                                 log: checkout completed / accepted with payment pending (wide event)
+web       INTERNAL  click                                    log: checkout submitted
+web       CLIENT      POST  -> checkout
+checkout  SERVER        POST /api/v1/checkout                log: checkout started
+checkout  CLIENT          GET cart                           (redis, cache.hit)
+checkout  CLIENT          SELECT shop.inventory ...          (postgresql, 2–5 queries)
+checkout  CLIENT          POST  -> payments
+payments  SERVER            POST /api/v1/charge              log: authorizing card
+payments  CLIENT              POST  -> gateway               log: payment gateway timed out (on error)
+                                                             log: charge completed / charge failed   (wide event)
+                                                             log: checkout completed / accepted with payment pending (wide event)
+                                                             log: order confirmed / placed with payment pending (wide event)
 ```
 
 - A fraction of charges (`--error-ratio`, default 25%) time out at the gateway after ~900 ms. The payments
   server span and the calls into and out of it are marked as errors. Checkout accepts the order with payment
   pending (HTTP 202), so its server span succeeds.
+- The `web` service stands in for the OpenTelemetry JS browser SDK. Its resource has `telemetry.sdk.language`
+  `webjs`, `user_agent.original`, `browser.language` and, for Chromium browsers, `browser.brands`,
+  `browser.platform` and `browser.mobile`. It has no cloud or k8s attributes. The trace context reaches
+  checkout through the fetch, so a trace starts at the shopper's click.
+- Each of 500 users belongs to one tenant (`user.team.id`) and has a browser session. One checkout in twenty
+  starts a new session, and the browser then also records `session.previous_id`. The browser passes `session.id`
+  to checkout and payments as if in W3C Baggage, so every wide event in a request carries it.
 - Every log is emitted inside its span's context, so OTLP carries the span's `TraceId` and `SpanId`. They are
   also written as `trace_id` and `span_id` log attributes, for backends that link on attributes.
-- Each service ends its request with one canonical **wide event** log (`main=true`) carrying the same
-  attributes as its server span: `http.request.method`, `http.route`, `http.response.status_code`,
-  `duration_ms`, `user.id`, `user.team.id`, `db.query_count`, `db.duration_ms`, `cache.hit`, `outcome` and,
+- Each service ends its request with one canonical **wide event** log (`main=true`). The browser's wide event
+  records what the shopper saw: `session.id`, `user.id`, `user.team.id`, the status code, `outcome` and the
+  user-perceived `duration_ms`. The checkout and payments wide events carry the same attributes as their server
+  span: `http.request.method`, `http.route`, `http.response.status_code`,
+  `duration_ms`, `user.id`, `user.team.id`, `session.id`, `db.query_count`, `db.duration_ms`, `cache.hit`, `outcome` and,
   on failure, `error.type`.
 - Each service runs as several replicas (checkout × 3, payments × 2) spread across the availability zones of
   one simulated EKS cluster. Every request is served by one replica of each service, so you can ask whether a
