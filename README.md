@@ -30,9 +30,19 @@ payments  CLIENT        POST  -> gateway         log: payment gateway timed out 
   attributes as its server span: `http.request.method`, `http.route`, `http.response.status_code`,
   `duration_ms`, `user.id`, `user.team.id`, `db.query_count`, `db.duration_ms`, `cache.hit`, `outcome` and,
   on failure, `error.type`.
-- Every resource has `service.name`, `service.namespace`, `service.version`, `service.team`,
-  `service.build.git_hash` and `deployment.environment.name`, plus anything in `OTEL_RESOURCE_ATTRIBUTES`
-  (for example `k8s.pod.name` or `cloud.region`).
+- Each service runs as several replicas (checkout × 3, payments × 2) spread across the availability zones of
+  one simulated EKS cluster. Every request is served by one replica of each service, so you can ask whether a
+  problem is one pod, one zone or one CPU architecture. The second replica of each service runs on an `arm64` node.
+- Every resource has `service.name`, `service.namespace`, `service.version`, `service.instance.id`,
+  `service.criticality`, `service.team`, `service.build.git_hash` and `deployment.environment.name`. It also
+  has the attributes a resource detector and the collector's `k8sattributes` processor would add in EKS:
+  `cloud.provider`, `cloud.platform`, `cloud.account.id`, `cloud.region`, `cloud.availability_zone`,
+  `k8s.cluster.name`, `k8s.namespace.name`, `k8s.deployment.name`, `k8s.replicaset.name`, `k8s.pod.name`,
+  `k8s.pod.uid`, `k8s.node.name`, `container.name`, `container.image.name`, `container.image.tags`,
+  `host.arch`, `process.runtime.name` and `process.runtime.version`. The generator sets these itself: it runs
+  as one process, so a collector would give every simulated service the same pod and node.
+- `OTEL_RESOURCE_ATTRIBUTES` is read by the SDK and overrides or adds to the simulated attributes. To move the
+  cluster to another region, use `--region`, which also sets the zones and the cluster name.
 
 Timestamps are simulated from the start of each interaction, so the process never sleeps inside a request.
 Span ends can be up to about a second in the future.
@@ -49,7 +59,8 @@ docker run --rm -e OTEL_EXPORTER_OTLP_ENDPOINT=http://host.docker.internal:4317 
 | `--rate` | `2` | checkout requests per second |
 | `--error-ratio` | `0.25` | fraction of payments that time out |
 | `--environment` | `local` | `deployment.environment.name` |
-| `--namespace` | `shop` | `service.namespace` |
+| `--namespace` | `shop` | `service.namespace` and `k8s.namespace.name` |
+| `--region` | `us-east-1` | `cloud.region`; zones are `<region>a`, `b` and `c` |
 | `--duration` | `0` | how long to run; `0` runs until SIGTERM |
 | `--seed` | `0` | random seed; `0` uses the clock |
 

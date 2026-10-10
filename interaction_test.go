@@ -23,8 +23,8 @@ type logRecorder struct {
 }
 
 func (r *logRecorder) Enabled(context.Context, sdklog.EnabledParameters) bool { return true }
-func (r *logRecorder) Shutdown(context.Context) error                        { return nil }
-func (r *logRecorder) ForceFlush(context.Context) error                      { return nil }
+func (r *logRecorder) Shutdown(context.Context) error                         { return nil }
+func (r *logRecorder) ForceFlush(context.Context) error                       { return nil }
 func (r *logRecorder) OnEmit(_ context.Context, rec *sdklog.Record) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -32,23 +32,30 @@ func (r *logRecorder) OnEmit(_ context.Context, rec *sdklog.Record) error {
 	return nil
 }
 
-func recordingService(t *testing.T, name string, spans *tracetest.SpanRecorder, logs *logRecorder) service {
+var testDeployment = deployment{environment: "test", namespace: "shop", region: "us-east-1"}
+
+func recordingFleet(t *testing.T, id serviceIdentity, rng *rand.Rand, spans *tracetest.SpanRecorder, logs *logRecorder) []instance {
 	t.Helper()
-	res := resource.NewSchemaless(attribute.String("service.name", name))
-	tp := sdktrace.NewTracerProvider(sdktrace.WithResource(res), sdktrace.WithSpanProcessor(spans))
-	lp := sdklog.NewLoggerProvider(sdklog.WithResource(res), sdklog.WithProcessor(logs))
-	return service{tracer: tp.Tracer(scope), logger: lp.Logger(scope)}
+	var fleet []instance
+	for _, attrs := range replicaResources(id, testDeployment, rng) {
+		res := resource.NewSchemaless(attrs...)
+		tp := sdktrace.NewTracerProvider(sdktrace.WithResource(res), sdktrace.WithSpanProcessor(spans))
+		lp := sdklog.NewLoggerProvider(sdklog.WithResource(res), sdklog.WithProcessor(logs))
+		fleet = append(fleet, instance{tracer: tp.Tracer(scope), logger: lp.Logger(scope)})
+	}
+	return fleet
 }
 
 func simulate(t *testing.T, n int, errorRatio float64) ([]sdktrace.ReadOnlySpan, []sdklog.Record) {
 	t.Helper()
 	spans := tracetest.NewSpanRecorder()
 	logs := &logRecorder{}
+	rng := rand.New(rand.NewPCG(1, 2))
 	sim := &simulator{
-		checkout:   recordingService(t, "checkout", spans, logs),
-		payments:   recordingService(t, "payments", spans, logs),
+		checkout:   recordingFleet(t, checkoutIdentity, rng, spans, logs),
+		payments:   recordingFleet(t, paymentsIdentity, rng, spans, logs),
 		errorRatio: errorRatio,
-		rng:        rand.New(rand.NewPCG(1, 2)),
+		rng:        rng,
 	}
 	start := time.Unix(1_700_000_000, 0)
 	for i := range n {
@@ -58,8 +65,12 @@ func simulate(t *testing.T, n int, errorRatio float64) ([]sdktrace.ReadOnlySpan,
 }
 
 func serviceOf(res *resource.Resource) string {
-	v, _ := res.Set().Value("service.name")
-	return v.AsString()
+	return resourceAttr(res, "service.name")
+}
+
+func resourceAttr(res *resource.Resource, key attribute.Key) string {
+	v, _ := res.Set().Value(key)
+	return v.Emit()
 }
 
 func attr(rec sdklog.Record, key string) (attribute.Value, bool) {
@@ -170,5 +181,71 @@ func TestPaymentErrorsStayOutOfCheckoutsServerSpan(t *testing.T) {
 	}
 	if ratio := float64(paymentErrors) / float64(payments); ratio < 0.18 || ratio > 0.32 {
 		t.Fatalf("payments error ratio %.2f, want about 0.25", ratio)
+	}
+}
+
+func TestReplicasAreDistinctPodsSpreadAcrossZones(t *testing.T) {
+	rng := rand.New(rand.NewPCG(1, 2))
+	for _, id := range []serviceIdentity{checkoutIdentity, paymentsIdentity} {
+		replicas := replicaResources(id, testDeployment, rng)
+		if len(replicas) != id.replicas {
+			t.Fatalf("%s has %d replicas, want %d", id.name, len(replicas), id.replicas)
+		}
+		seen := map[string]map[string]bool{}
+		for _, attrs := range replicas {
+			res := resource.NewSchemaless(attrs...)
+			for _, key := range []attribute.Key{
+				"service.instance.id", "service.criticality", "cloud.provider", "cloud.platform", "cloud.account.id",
+				"cloud.region", "cloud.availability_zone", "k8s.cluster.name", "k8s.namespace.name", "k8s.deployment.name",
+				"k8s.replicaset.name", "k8s.pod.name", "k8s.pod.uid", "k8s.node.name", "container.name",
+				"container.image.name", "container.image.tags", "host.arch", "process.runtime.name", "process.runtime.version",
+			} {
+				v := resourceAttr(res, key)
+				if v == "" {
+					t.Fatalf("%s replica is missing %s", id.name, key)
+				}
+				if seen[string(key)] == nil {
+					seen[string(key)] = map[string]bool{}
+				}
+				seen[string(key)][v] = true
+			}
+		}
+		for _, key := range []string{"service.instance.id", "k8s.pod.name", "k8s.pod.uid", "cloud.availability_zone"} {
+			if len(seen[key]) != id.replicas {
+				t.Fatalf("%s replicas share a %s: %v", id.name, key, seen[key])
+			}
+		}
+		if len(seen["k8s.replicaset.name"]) != 1 {
+			t.Fatalf("%s replicas belong to different replica sets: %v", id.name, seen["k8s.replicaset.name"])
+		}
+	}
+}
+
+func TestRequestsSpreadAcrossReplicasAndStayOnOne(t *testing.T) {
+	spans, logs := simulate(t, 100, 0.25)
+	perService := map[string]map[string]bool{}
+	perTrace := map[string]string{}
+	note := func(res *resource.Resource, traceID trace.TraceID) {
+		svc, inst := serviceOf(res), resourceAttr(res, "service.instance.id")
+		if perService[svc] == nil {
+			perService[svc] = map[string]bool{}
+		}
+		perService[svc][inst] = true
+		key := traceID.String() + "/" + svc
+		if prev, ok := perTrace[key]; ok && prev != inst {
+			t.Fatalf("one %s request was served by two instances, %s and %s", svc, prev, inst)
+		}
+		perTrace[key] = inst
+	}
+	for _, s := range spans {
+		note(s.Resource(), s.SpanContext().TraceID())
+	}
+	for _, rec := range logs {
+		note(rec.Resource(), rec.TraceID())
+	}
+	for svc, replicas := range map[string]int{"checkout": checkoutIdentity.replicas, "payments": paymentsIdentity.replicas} {
+		if len(perService[svc]) != replicas {
+			t.Fatalf("%s requests were served by %d instances, want %d", svc, len(perService[svc]), replicas)
+		}
 	}
 }

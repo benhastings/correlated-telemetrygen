@@ -2,9 +2,10 @@
 // record belongs to a span of the same request, so a backend can navigate from a log line to
 // its trace and from a span to its logs.
 //
-// It simulates a checkout service that calls a payments service. The OTLP endpoint and any
-// extra resource attributes come from the standard OTEL_EXPORTER_OTLP_* and
-// OTEL_RESOURCE_ATTRIBUTES environment variables.
+// It simulates a checkout service that calls a payments service, each running as several
+// replicas in a Kubernetes cluster. The OTLP endpoint comes from the standard
+// OTEL_EXPORTER_OTLP_* environment variables, and OTEL_RESOURCE_ATTRIBUTES overrides or adds
+// to the simulated resource attributes.
 package main
 
 import (
@@ -32,20 +33,12 @@ const scope = "github.com/brandonapol/correlated-telemetrygen"
 // version is set at build time with -ldflags "-X main.version=...".
 var version = "dev"
 
-type serviceIdentity struct {
-	name, version, team, gitHash string
-}
-
-var (
-	checkoutIdentity = serviceIdentity{name: "checkout", version: "v2.4.1", team: "core-commerce", gitHash: "8f7a2b3c"}
-	paymentsIdentity = serviceIdentity{name: "payments", version: "v1.9.0", team: "core-payments", gitHash: "c41d09e7"}
-)
-
 func main() {
 	rate := flag.Float64("rate", 2, "checkout requests per second")
 	errorRatio := flag.Float64("error-ratio", 0.25, "fraction of payments that time out at the gateway")
 	environment := flag.String("environment", "local", "deployment.environment.name on every resource")
-	namespace := flag.String("namespace", "shop", "service.namespace on every resource")
+	namespace := flag.String("namespace", "shop", "service.namespace and k8s.namespace.name on every resource")
+	region := flag.String("region", "us-east-1", "cloud.region of the simulated cluster")
 	duration := flag.Duration("duration", 0, "how long to run; 0 runs until interrupted")
 	seed := flag.Uint64("seed", 0, "random seed; 0 picks one from the clock")
 	showVersion := flag.Bool("version", false, "print the version and exit")
@@ -67,24 +60,30 @@ func main() {
 		defer cancel()
 	}
 
-	var shutdowns []func(context.Context) error
-	newService := func(id serviceIdentity) service {
-		svc, shutdown, err := newOTLPService(ctx, id, *namespace, *environment)
-		if err != nil {
-			log.Fatalf("setting up %s: %v", id.name, err)
-		}
-		shutdowns = append(shutdowns, shutdown)
-		return svc
-	}
-
 	if *seed == 0 {
 		*seed = uint64(time.Now().UnixNano())
 	}
+	rng := rand.New(rand.NewPCG(*seed, *seed>>1))
+	d := deployment{environment: *environment, namespace: *namespace, region: *region}
+
+	var shutdowns []func(context.Context) error
+	newFleet := func(id serviceIdentity) []instance {
+		var fleet []instance
+		for _, attrs := range replicaResources(id, d, rng) {
+			inst, shutdown, err := newOTLPInstance(ctx, attrs)
+			if err != nil {
+				log.Fatalf("setting up %s: %v", id.name, err)
+			}
+			shutdowns = append(shutdowns, shutdown)
+			fleet = append(fleet, inst)
+		}
+		return fleet
+	}
 	sim := &simulator{
-		checkout:   newService(checkoutIdentity),
-		payments:   newService(paymentsIdentity),
+		checkout:   newFleet(checkoutIdentity),
+		payments:   newFleet(paymentsIdentity),
 		errorRatio: *errorRatio,
-		rng:        rand.New(rand.NewPCG(*seed, *seed>>1)),
+		rng:        rng,
 	}
 
 	log.Printf("correlated-telemetrygen %s: %.2g checkout requests/s, %.0f%% payment errors", version, *rate, *errorRatio*100)
@@ -114,31 +113,25 @@ loop:
 	log.Printf("sent %d interactions", sent)
 }
 
-// newOTLPService builds a tracer and a logger that share one resource and export over OTLP gRPC.
-func newOTLPService(ctx context.Context, id serviceIdentity, namespace, environment string) (service, func(context.Context) error, error) {
+// newOTLPInstance builds a tracer and a logger that share one resource and export over OTLP
+// gRPC. OTEL_RESOURCE_ATTRIBUTES is applied last, so it overrides the simulated attributes.
+func newOTLPInstance(ctx context.Context, attrs []attribute.KeyValue) (instance, func(context.Context) error, error) {
 	res, err := resource.New(ctx,
 		resource.WithTelemetrySDK(),
+		resource.WithAttributes(attrs...),
 		resource.WithFromEnv(),
-		resource.WithAttributes(
-			attribute.String("service.name", id.name),
-			attribute.String("service.namespace", namespace),
-			attribute.String("service.version", id.version),
-			attribute.String("service.team", id.team),
-			attribute.String("service.build.git_hash", id.gitHash),
-			attribute.String("deployment.environment.name", environment),
-		),
 	)
 	if err != nil {
-		return service{}, nil, err
+		return instance{}, nil, err
 	}
 
 	spanExporter, err := otlptracegrpc.New(ctx)
 	if err != nil {
-		return service{}, nil, err
+		return instance{}, nil, err
 	}
 	logExporter, err := otlploggrpc.New(ctx)
 	if err != nil {
-		return service{}, nil, err
+		return instance{}, nil, err
 	}
 	tp := sdktrace.NewTracerProvider(sdktrace.WithResource(res), sdktrace.WithBatcher(spanExporter))
 	lp := sdklog.NewLoggerProvider(sdklog.WithResource(res), sdklog.WithProcessor(sdklog.NewBatchProcessor(logExporter)))
@@ -146,5 +139,5 @@ func newOTLPService(ctx context.Context, id serviceIdentity, namespace, environm
 	shutdown := func(ctx context.Context) error {
 		return errors.Join(tp.Shutdown(ctx), lp.Shutdown(ctx))
 	}
-	return service{tracer: tp.Tracer(scope), logger: lp.Logger(scope)}, shutdown, nil
+	return instance{tracer: tp.Tracer(scope), logger: lp.Logger(scope)}, shutdown, nil
 }
