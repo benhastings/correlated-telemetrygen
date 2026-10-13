@@ -1,0 +1,68 @@
+# Domain conventions: the shop's business vocabulary, in the shop.* namespace.
+file_format: definition/2
+
+attributes:
+  - key: shop.cart.item_count
+    type: int
+    brief: Number of items in the shopper's cart.
+    stability: development
+    examples: [3]
+  - key: shop.order.id
+    type: string
+    brief: Identifier of the order.
+    stability: development
+    examples: ["ord_x2kqp7bn4wzt"]
+  - key: shop.order.amount
+    type: double
+    brief: Total of the order, in `shop.order.currency`.
+    stability: development
+    examples: [129.95]
+  - key: shop.order.currency
+    type: string
+    brief: ISO 4217 code of the order's currency.
+    stability: development
+    examples: ["USD"]
+  - key: shop.payment.method
+    type:
+      members:
+        - id: card
+          value: card
+          brief: A credit or debit card.
+          stability: development
+        - id: apple_pay
+          value: apple_pay
+          brief: Apple Pay.
+          stability: development
+        - id: paypal
+          value: paypal
+          brief: PayPal.
+          stability: development
+    brief: How the shopper pays.
+    stability: development
+  - key: shop.payment.provider
+    type:
+      members:
+        - id: stripe
+          value: stripe
+          brief: Stripe.
+          stability: development
+        - id: adyen
+          value: adyen
+          brief: Adyen.
+          stability: development
+        - id: braintree
+          value: braintree
+          brief: Braintree.
+          stability: development
+    brief: The external payment provider that processed the payment.
+    stability: development
+  - key: shop.payment.amount
+    type: double
+    brief: Amount charged, in `shop.payment.currency`.
+    stability: development
+    examples: [129.95]
+  - key: shop.payment.currency
+    type: string
+    brief: ISO 4217 code of the payment's currency.
+    stability: development
+    examples: ["USD"]

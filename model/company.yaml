@@ -1,0 +1,346 @@
+# Company conventions: attributes and requirements shared by every service, on top of the
+# OpenTelemetry semantic conventions.
+file_format: definition/2
+
+attributes:
+  - key: service.team
+    type: string
+    brief: The team that owns the service.
+    stability: development
+    examples: ["core-commerce"]
+  - key: service.build.git_hash
+    type: string
+    brief: The short git commit hash the running service was built from.
+    stability: development
+    examples: ["8f7a2b3c"]
+  - key: user.team.id
+    type: string
+    brief: The customer team (tenant) the user belongs to.
+    note: >
+      Extends OpenTelemetry's `user.*` namespace. A user belongs to exactly one team.
+    stability: development
+    examples: ["enterprise_corp_a"]
+  - key: user.team.plan
+    type:
+      members:
+        - id: enterprise
+          value: enterprise
+          brief: An enterprise contract.
+          stability: development
+        - id: smb
+          value: smb
+          brief: A small or medium business plan.
+          stability: development
+        - id: free
+          value: free
+          brief: The free tier.
+          stability: development
+    brief: The plan of the user's team.
+    stability: development
+  - key: main
+    type: boolean
+    brief: True on the one wide event a service emits for each request it handles.
+    note: >
+      A wide event is the canonical log line for a request. It carries everything known about
+      the request, so most questions can be answered from wide events alone.
+    stability: development
+    examples: [true]
+  - key: outcome
+    type:
+      members:
+        - id: success
+          value: success
+          brief: The request did what was asked.
+          stability: development
+        - id: payment_pending
+          value: payment_pending
+          brief: The order was accepted, but the payment did not complete.
+          stability: development
+        - id: upstream_error
+          value: upstream_error
+          brief: A dependency outside the company failed the request.
+          stability: development
+        - id: db_error
+          value: db_error
+          brief: The database failed the request.
+          stability: development
+    brief: How the request ended, from the point of view of the service reporting it.
+    stability: development
+  - key: duration_ms
+    type: double
+    brief: Wall-clock duration of the request in milliseconds.
+    stability: development
+    examples: [104.2]
+  - key: cpu_ms
+    type: double
+    brief: CPU time spent on the request in milliseconds.
+    note: >
+      For a browser, the main-thread time spent handling the interaction.
+    stability: development
+    examples: [3.7]
+  - key: db.query_count
+    type: int
+    brief: Number of database statements the request ran.
+    stability: development
+    examples: [4]
+  - key: db.duration_ms
+    type: double
+    brief: Total time the request spent waiting on the database, in milliseconds.
+    stability: development
+    examples: [21.5]
+  - key: cache.hit
+    type: boolean
+    brief: Whether the request's cache lookup found what it was looking for.
+    stability: development
+    examples: [true]
+  - key: trace_id
+    type: string
+    brief: The trace ID of the log record, as 32 lowercase hex characters.
+    note: >
+      Duplicates the log record's TraceId field, for backends that link logs to traces by
+      attribute.
+    stability: development
+    examples: ["4d7507e69dbf32817b1b01cd19b58772"]
+  - key: span_id
+    type: string
+    brief: The span ID of the log record, as 16 lowercase hex characters.
+    stability: development
+    examples: ["0ef86d98a07436d6"]
+
+attribute_groups:
+  - id: shop.resource
+    visibility: public
+    brief: Attributes every resource must have.
+    stability: development
+    attributes:
+      - ref: service.name
+        requirement_level: required
+      - ref: service.namespace
+        requirement_level: required
+      - ref: service.version
+        requirement_level: required
+      - ref: service.criticality
+        requirement_level: required
+      - ref: service.team
+        requirement_level: required
+      - ref: service.build.git_hash
+        requirement_level: required
+      - ref: deployment.environment.name
+        requirement_level: required
+      - ref: telemetry.sdk.name
+        requirement_level: required
+      - ref: telemetry.sdk.language
+        requirement_level: required
+      - ref: telemetry.sdk.version
+        requirement_level: required
+
+  - id: shop.resource.k8s
+    visibility: public
+    brief: Attributes every resource of a service running in Kubernetes must have.
+    stability: development
+    attributes:
+      - ref: service.instance.id
+        requirement_level: required
+      - ref: cloud.provider
+        requirement_level: required
+      - ref: cloud.platform
+        requirement_level: required
+      - ref: cloud.account.id
+        requirement_level: required
+      - ref: cloud.region
+        requirement_level: required
+      - ref: cloud.availability_zone
+        requirement_level: required
+      - ref: k8s.cluster.name
+        requirement_level: required
+      - ref: k8s.namespace.name
+        requirement_level: required
+      - ref: k8s.deployment.name
+        requirement_level: required
+      - ref: k8s.replicaset.name
+        requirement_level: required
+      - ref: k8s.pod.name
+        requirement_level: required
+      - ref: k8s.pod.uid
+        requirement_level: required
+      - ref: k8s.node.name
+        requirement_level: required
+      - ref: container.name
+        requirement_level: required
+      - ref: container.image.name
+        requirement_level: required
+      - ref: container.image.tags
+        requirement_level: required
+      - ref: host.arch
+        requirement_level: required
+      - ref: process.runtime.name
+        requirement_level: required
+      - ref: process.runtime.version
+        requirement_level: required
+
+  - id: shop.resource.browser
+    visibility: public
+    brief: Attributes every resource of the browser front end must have.
+    stability: development
+    attributes:
+      - ref: user_agent.original
+        requirement_level: required
+      - ref: browser.language
+        requirement_level: required
+      - ref: browser.brands
+        requirement_level:
+          conditionally_required: If the browser supports User-Agent Client Hints.
+      - ref: browser.platform
+        requirement_level:
+          conditionally_required: If the browser supports User-Agent Client Hints.
+      - ref: browser.mobile
+        requirement_level:
+          conditionally_required: If the browser supports User-Agent Client Hints.
+
+  - id: shop.log
+    visibility: public
+    brief: Attributes every log record must have.
+    stability: development
+    attributes:
+      - ref: trace_id
+        requirement_level: required
+      - ref: span_id
+        requirement_level: required
+
+  - id: shop.log.context
+    visibility: public
+    brief: Attributes a log record that is not a wide event may carry.
+    stability: development
+    attributes:
+      - ref: user.id
+      - ref: session.id
+      - ref: session.previous_id
+      - ref: shop.cart.item_count
+      - ref: shop.order.id
+      - ref: shop.payment.provider
+      - ref: shop.payment.method
+      - ref: shop.payment.amount
+      - ref: shop.payment.currency
+      - ref: error.type
+      - ref: db.response.status_code
+
+  - id: shop.wide_event
+    visibility: public
+    brief: Attributes every wide event must have, whichever service emits it.
+    stability: development
+    attributes:
+      - ref: main
+        requirement_level: required
+      - ref: outcome
+        requirement_level: required
+      - ref: duration_ms
+        requirement_level: required
+      - ref: cpu_ms
+        requirement_level: required
+      - ref: user.id
+        requirement_level: required
+      - ref: user.team.id
+        requirement_level: required
+      - ref: user.team.plan
+        requirement_level: required
+      - ref: session.id
+        requirement_level: required
+      - ref: http.request.method
+        requirement_level: required
+      - ref: http.response.status_code
+        requirement_level: required
+      - ref: error.type
+        requirement_level:
+          conditionally_required: If `outcome` is not `success`.
+      - ref: shop.order.id
+        requirement_level:
+          conditionally_required: If the order was placed.
+
+  - id: shop.wide_event.web
+    visibility: public
+    brief: Attributes the browser's wide event must have.
+    stability: development
+    attributes:
+      - ref: url.full
+        requirement_level: required
+      - ref: session.previous_id
+        requirement_level:
+          conditionally_required: If the session replaced an earlier one.
+      - ref: shop.cart.item_count
+        requirement_level: required
+      - ref: shop.order.amount
+        requirement_level: required
+      - ref: shop.order.currency
+        requirement_level: required
+      - ref: shop.payment.method
+        requirement_level: required
+
+  - id: shop.wide_event.server
+    visibility: public
+    brief: Attributes the wide event of an HTTP server must have.
+    stability: development
+    attributes:
+      - ref: http.route
+        requirement_level: required
+      - ref: url.path
+        requirement_level: required
+      - ref: url.scheme
+        requirement_level: required
+      - ref: server.address
+        requirement_level: required
+      - ref: server.port
+        requirement_level: required
+      - ref: client.address
+        requirement_level: required
+      - ref: network.peer.address
+        requirement_level: required
+      - ref: network.protocol.version
+        requirement_level: required
+      - ref: user_agent.original
+        requirement_level: required
+      - ref: http.request.body.size
+        requirement_level: required
+      - ref: http.response.body.size
+        requirement_level: required
+      - ref: db.query_count
+        requirement_level: required
+      - ref: cache.hit
+        requirement_level: required
+
+  - id: shop.wide_event.checkout
+    visibility: public
+    brief: Attributes checkout's wide event must have.
+    stability: development
+    attributes:
+      - ref: db.duration_ms
+        requirement_level: required
+      - ref: shop.cart.item_count
+        requirement_level: required
+      - ref: shop.order.amount
+        requirement_level: required
+      - ref: shop.order.currency
+        requirement_level: required
+      - ref: shop.payment.method
+        requirement_level: required
+      - ref: feature_flag.key
+        requirement_level: required
+      - ref: feature_flag.result.variant
+        requirement_level: required
+      - ref: feature_flag.provider.name
+        requirement_level: required
+      - ref: feature_flag.result.reason
+        requirement_level: required
+
+  - id: shop.wide_event.payments
+    visibility: public
+    brief: Attributes the payments wide event must have.
+    stability: development
+    attributes:
+      - ref: shop.payment.provider
+        requirement_level: required
+      - ref: shop.payment.method
+        requirement_level: required
+      - ref: shop.payment.amount
+        requirement_level: required
+      - ref: shop.payment.currency
+        requirement_level: required

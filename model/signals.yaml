@@ -1,0 +1,169 @@
+# The spans and events the shop's services emit. Live-check pairs samples with these through
+# the matchers in .weaver.toml.
+file_format: definition/2
+
+spans:
+  - type: shop.web.click
+    name:
+      note: The constant `click`.
+    kind: internal
+    brief: A shopper's click in the browser that starts a request.
+    stability: development
+    requirement_level: recommended
+    attributes:
+      - ref: session.id
+        requirement_level: required
+      - ref: session.previous_id
+        requirement_level:
+          conditionally_required: If the session replaced an earlier one.
+
+  - type: shop.web.fetch
+    name:
+      note: The HTTP method, as the browser SDK's fetch instrumentation names it.
+    kind: client
+    brief: A request from the browser to the shop's API.
+    stability: development
+    requirement_level: recommended
+    attributes:
+      - ref: http.request.method
+        requirement_level: required
+      - ref: url.full
+        requirement_level: required
+      - ref: server.address
+        requirement_level: required
+      - ref: server.port
+        requirement_level: required
+      - ref: http.response.status_code
+        requirement_level:
+          conditionally_required: If a response was received.
+      - ref: error.type
+        requirement_level:
+          conditionally_required: If the request failed.
+      - ref: session.id
+        requirement_level: required
+      - ref: session.previous_id
+        requirement_level:
+          conditionally_required: If the session replaced an earlier one.
+
+  - type: shop.http.server
+    name:
+      note: "`{http.request.method} {http.route}`."
+    kind: server
+    brief: An HTTP request served by one of the shop's services.
+    note: >
+      The server span also carries the attributes of its service's wide event, which the
+      matcher permits.
+    stability: development
+    requirement_level: recommended
+    attributes:
+      - ref: http.request.method
+        requirement_level: required
+      - ref: http.route
+        requirement_level: required
+      - ref: url.path
+        requirement_level: required
+      - ref: url.scheme
+        requirement_level: required
+      - ref: http.response.status_code
+        requirement_level: required
+      - ref: server.address
+        requirement_level: required
+      - ref: server.port
+        requirement_level: required
+      - ref: client.address
+        requirement_level: required
+      - ref: network.peer.address
+        requirement_level: required
+      - ref: network.protocol.version
+        requirement_level: required
+      - ref: user_agent.original
+        requirement_level: required
+      - ref: http.request.body.size
+        requirement_level: recommended
+      - ref: http.response.body.size
+        requirement_level: recommended
+      - ref: error.type
+        requirement_level:
+          conditionally_required: If the request failed.
+
+  - type: shop.http.client
+    name:
+      note: "`{http.request.method} {url.template}`."
+    kind: client
+    brief: An HTTP request from one of the shop's services to another service or an external API.
+    stability: development
+    requirement_level: recommended
+    attributes:
+      - ref: http.request.method
+        requirement_level: required
+      - ref: server.address
+        requirement_level: required
+      - ref: server.port
+        requirement_level: required
+      - ref: url.full
+        requirement_level: required
+      - ref: url.template
+        requirement_level: required
+      - ref: network.protocol.version
+        requirement_level: required
+      - ref: network.peer.address
+        requirement_level:
+          conditionally_required: If the peer is one of the shop's pods.
+      - ref: network.peer.port
+        requirement_level:
+          conditionally_required: If the peer is one of the shop's pods.
+      - ref: service.peer.name
+        requirement_level:
+          conditionally_required: If the peer is one of the shop's services.
+      - ref: service.peer.namespace
+        requirement_level:
+          conditionally_required: If the peer is one of the shop's services.
+      - ref: http.response.status_code
+        requirement_level:
+          conditionally_required: If a response was received.
+      - ref: error.type
+        requirement_level:
+          conditionally_required: If the request failed.
+
+  - type: shop.db.client
+    name:
+      note: "`db.query.summary`, or for Redis `db.operation.name`."
+    kind: client
+    brief: A statement or command sent to Postgres or Redis.
+    stability: development
+    requirement_level: recommended
+    attributes:
+      - ref: db.system.name
+        requirement_level: required
+      - ref: db.namespace
+        requirement_level: required
+      - ref: db.operation.name
+        requirement_level: required
+      - ref: db.query.text
+        requirement_level: required
+      - ref: server.address
+        requirement_level: required
+      - ref: server.port
+        requirement_level: required
+      - ref: db.collection.name
+        requirement_level:
+          conditionally_required: If the statement operates on one table.
+      - ref: db.query.summary
+        requirement_level:
+          conditionally_required: If the database is Postgres.
+      - ref: db.response.returned_rows
+        requirement_level:
+          conditionally_required: If the statement is a SELECT that succeeded.
+      - ref: db.response.status_code
+        requirement_level:
+          conditionally_required: If the statement failed.
+      - ref: error.type
+        requirement_level:
+          conditionally_required: If the statement failed.
+      - ref: cache.hit
+        requirement_level:
+          conditionally_required: If the command is a cache lookup.
+
+imports:
+  events:
+    - feature_flag.evaluation

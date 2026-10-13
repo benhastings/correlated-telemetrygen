@@ -41,3 +41,19 @@ jobs:
       - run: go vet ./...
       - run: go test -race ./...
       - run: docker build .
+  telemetry-schema:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Check the registry
+        run: docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD:/work" -w /work otel/weaver:v0.27.0 registry check -r model
+      - name: Live-check the generator's telemetry against the registry and policies
+        run: ./scripts/live-check.sh
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: live-check-report
+          path: live-check-report/
