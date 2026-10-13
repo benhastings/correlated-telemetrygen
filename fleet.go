@@ -30,23 +30,30 @@ var (
 
 const awsAccountID = "123456789012"
 
+// replica is one simulated pod, or for the web front end one browser profile.
+type replica struct {
+	resource []attribute.KeyValue
+	podIP    string // empty for a browser
+}
+
 // replicaResources lays the replicas of a service out across availability zones and returns
 // the resource attributes of each, as the SDK, a resource detector and the k8s attributes
 // processor would report them for a pod in EKS. The second replica of each service runs on
 // an arm64 (Graviton) node.
-func replicaResources(id serviceIdentity, d deployment, rng *rand.Rand) [][]attribute.KeyValue {
+func replicaResources(id serviceIdentity, d deployment, rng *rand.Rand) []replica {
 	zones := []string{"a", "b", "c"}
 	replicaSet := id.name + "-" + k8sSuffix(rng, 9)
-	var replicas [][]attribute.KeyValue
+	var replicas []replica
 	for i := range id.replicas {
 		zone := i % len(zones)
 		arch := "amd64"
 		if i == 1 {
 			arch = "arm64"
 		}
-		// Each zone has its own /19 subnet in a 10.0.0.0/16 VPC.
+		// Each zone has its own /19 subnet in a 10.0.0.0/16 VPC, and pods get VPC addresses.
 		node := fmt.Sprintf("ip-10-0-%d-%d.ec2.internal", 32*zone+rng.IntN(32), 1+rng.IntN(254))
-		replicas = append(replicas, []attribute.KeyValue{
+		podIP := fmt.Sprintf("10.0.%d.%d", 32*zone+rng.IntN(32), 1+rng.IntN(254))
+		replicas = append(replicas, replica{podIP: podIP, resource: []attribute.KeyValue{
 			attribute.String("service.name", id.name),
 			attribute.String("service.namespace", d.namespace),
 			attribute.String("service.version", id.version),
@@ -76,7 +83,7 @@ func replicaResources(id serviceIdentity, d deployment, rng *rand.Rand) [][]attr
 			attribute.String("telemetry.sdk.name", "opentelemetry"),
 			attribute.String("telemetry.sdk.language", "go"),
 			attribute.String("telemetry.sdk.version", sdk.Version()),
-		})
+		}})
 	}
 	return replicas
 }
@@ -124,8 +131,8 @@ var browserProfiles = []browserProfile{
 // browserResources returns the resource attributes of the web front end in each browser
 // profile, as the OpenTelemetry JS browser SDK reports them. A browser has no cloud or k8s
 // context and no service.instance.id.
-func browserResources(d deployment) [][]attribute.KeyValue {
-	var resources [][]attribute.KeyValue
+func browserResources(d deployment) []replica {
+	var resources []replica
 	for _, p := range browserProfiles {
 		attrs := []attribute.KeyValue{
 			attribute.String("service.name", webIdentity.name),
@@ -148,7 +155,7 @@ func browserResources(d deployment) [][]attribute.KeyValue {
 				attribute.Bool("browser.mobile", p.mobile),
 			)
 		}
-		resources = append(resources, attrs)
+		resources = append(resources, replica{resource: attrs})
 	}
 	return resources
 }

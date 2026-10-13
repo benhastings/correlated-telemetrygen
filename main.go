@@ -20,7 +20,6 @@ import (
 	"syscall"
 	"time"
 
-	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploggrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	otellog "go.opentelemetry.io/otel/log"
@@ -72,10 +71,10 @@ func main() {
 	d := deployment{environment: *environment, namespace: *namespace, region: *region}
 
 	var shutdowns []func(context.Context) error
-	newFleet := func(resources [][]attribute.KeyValue) []instance {
+	newFleet := func(replicas []replica) []instance {
 		var fleet []instance
-		for _, attrs := range resources {
-			inst, shutdown, err := newOTLPInstance(ctx, attrs)
+		for _, r := range replicas {
+			inst, shutdown, err := newOTLPInstance(ctx, r)
 			if err != nil {
 				log.Fatalf("setting up telemetry: %v", err)
 			}
@@ -88,7 +87,7 @@ func main() {
 		newFleet(browserResources(d)),
 		newFleet(replicaResources(checkoutIdentity, d, rng)),
 		newFleet(replicaResources(paymentsIdentity, d, rng)),
-		*errorRatio, rng,
+		simConfig{namespace: *namespace, errorRatio: *errorRatio}, rng,
 	)
 
 	log.Printf("correlated-telemetrygen %s: %.2g checkout requests/s, %.0f%% payment errors", version, *rate, *errorRatio*100)
@@ -122,10 +121,10 @@ loop:
 // gRPC. The resource attributes include telemetry.sdk.*, because the web front end reports the
 // browser SDK rather than this one. OTEL_RESOURCE_ATTRIBUTES is applied last, so it overrides
 // the simulated attributes.
-func newOTLPInstance(ctx context.Context, attrs []attribute.KeyValue) (instance, func(context.Context) error, error) {
+func newOTLPInstance(ctx context.Context, r replica) (instance, func(context.Context) error, error) {
 	res, err := resource.New(ctx,
 		resource.WithSchemaURL(schemaURL),
-		resource.WithAttributes(attrs...),
+		resource.WithAttributes(r.resource...),
 		resource.WithFromEnv(),
 	)
 	if err != nil {
@@ -149,5 +148,6 @@ func newOTLPInstance(ctx context.Context, attrs []attribute.KeyValue) (instance,
 	return instance{
 		tracer: tp.Tracer(scope, trace.WithSchemaURL(schemaURL)),
 		logger: lp.Logger(scope, otellog.WithSchemaURL(schemaURL)),
+		podIP:  r.podIP,
 	}, shutdown, nil
 }

@@ -19,13 +19,13 @@ checkout  CLIENT          GET cart                           (redis, cache.hit)
 checkout  CLIENT          SELECT shop.inventory ...          (postgresql, 2–5 queries)
 checkout  CLIENT          POST  -> payments
 payments  SERVER            POST /api/v1/charge              log: authorizing card
-payments  CLIENT              POST  -> gateway               log: payment gateway timed out (on error)
+payments  CLIENT              POST  -> payment provider      log: payment gateway timed out (on error)
                                                              log: charge completed / charge failed   (wide event)
                                                              log: checkout completed / accepted with payment pending (wide event)
                                                              log: order confirmed / placed with payment pending (wide event)
 ```
 
-- A fraction of charges (`--error-ratio`, default 25%) time out at the gateway after ~900 ms. The payments
+- A fraction of charges (`--error-ratio`, default 25%) time out at the payment provider after ~900 ms. The payments
   server span and the calls into and out of it are marked as errors. Checkout accepts the order with payment
   pending (HTTP 202), so its server span succeeds.
 - The `web` service stands in for the OpenTelemetry JS browser SDK. Its resource has `telemetry.sdk.language`
@@ -40,9 +40,17 @@ payments  CLIENT              POST  -> gateway               log: payment gatewa
 - Each service ends its request with one canonical **wide event** log (`main=true`). The browser's wide event
   records what the shopper saw: `session.id`, `user.id`, `user.team.id`, the status code, `outcome` and the
   user-perceived `duration_ms`. The checkout and payments wide events carry the same attributes as their server
-  span: `http.request.method`, `http.route`, `http.response.status_code`,
-  `duration_ms`, `user.id`, `user.team.id`, `session.id`, `db.query_count`, `db.duration_ms`, `cache.hit`, `outcome` and,
-  on failure, `error.type`.
+  span: `http.request.method`, `http.route`, `url.path`, `url.scheme`, `server.address`, `server.port`,
+  `client.address`, `network.peer.address`, `network.protocol.version`, `user_agent.original`,
+  `http.request.body.size`, `http.response.body.size`, `http.response.status_code`, `duration_ms`, `user.id`,
+  `user.team.id`, `session.id`, `db.query_count`, `db.duration_ms`, `cache.hit`, `outcome` and, on failure,
+  `error.type`.
+- HTTP spans follow the [HTTP span conventions](https://opentelemetry.io/docs/specs/semconv/http/http-spans/).
+  Checkout's `client.address` is the shopper's IP (from `X-Forwarded-For`), and its `network.peer.address` is the
+  load balancer node. On the call from checkout to payments, `network.peer.address` is the IP of the payments pod
+  that served it, and `service.peer.name` names the service. Payments charges cards through one of three payment
+  providers, which appears as the gateway span's `server.address` and `url.full`. Server span status is left unset
+  unless the response is 5xx.
 - Each service runs as several replicas (checkout × 3, payments × 2) spread across the availability zones of
   one simulated EKS cluster. Every request is served by one replica of each service, so you can ask whether a
   problem is one pod, one zone or one CPU architecture. The second replica of each service runs on an `arm64` node.
