@@ -15,10 +15,11 @@ Each interaction is a shopper clicking "place order" in the `web` front end, whi
 web       INTERNAL  click                                    log: checkout submitted
 web       CLIENT      POST  -> checkout
 checkout  SERVER        POST /api/v1/checkout                log: checkout started
+                                                             event: feature_flag.evaluation (new-checkout-flow)
 checkout  CLIENT          GET                                (redis: the cart, cache.hit)
 checkout  CLIENT          SELECT shop.inventory ...          (postgresql: 3–5 statements ending in INSERT shop.orders)
 checkout  CLIENT          POST  -> payments
-payments  SERVER            POST /api/v1/charge              log: authorizing card
+payments  SERVER            POST /api/v1/charge              log: authorizing payment
 payments  CLIENT              POST  -> payment provider      log: payment gateway timed out (on error)
                                                              log: charge completed / charge failed   (wide event)
                                                              log: checkout completed / accepted with payment pending (wide event)
@@ -73,6 +74,37 @@ payments  CLIENT              POST  -> payment provider      log: payment gatewa
   as one process, so a collector would give every simulated service the same pod and node.
 - `OTEL_RESOURCE_ATTRIBUTES` is read by the SDK and overrides or adds to the simulated attributes. To move the
   cluster to another region, use `--region`, which also sets the zones and the cluster name.
+
+## Conventions
+
+Telemetry follows the [OpenTelemetry semantic conventions](https://opentelemetry.io/docs/specs/semconv/) v1.44.0
+(the schema URL on every resource and scope). On top of those, it uses company and domain conventions:
+
+**Company conventions**, shared by every service:
+
+| Attribute | Where | |
+|---|---|---|
+| `service.team`, `service.build.git_hash` | resource | owning team and build |
+| `user.team.id`, `user.team.plan` | server spans, wide events | the customer team and its plan (`enterprise`, `smb`, `free`); `user.team.*` extends OTel's `user.*` namespace |
+| `main` | logs | `true` on the one wide event per service per request |
+| `outcome` | wide events | `success`, `payment_pending`, `upstream_error` or `db_error` |
+| `duration_ms`, `cpu_ms` | wide events | wall-clock time and simulated CPU time of the request |
+| `db.query_count`, `db.duration_ms`, `cache.hit` | backend wide events | database and cache work done for the request |
+| `trace_id`, `span_id` | logs | the record's trace context, for backends that link on attributes |
+
+**Domain conventions** (`shop.*`):
+
+| Attribute | Where |
+|---|---|
+| `shop.cart.item_count` | checkout and web logs and wide events |
+| `shop.order.id`, `shop.order.amount`, `shop.order.currency` | checkout and web wide events (`shop.order.id` also on payments), unless the order failed |
+| `shop.payment.method` | `card`, `apple_pay` or `paypal` |
+| `shop.payment.provider`, `shop.payment.amount`, `shop.payment.currency` | payments logs and wide events |
+
+Checkout evaluates the `new-checkout-flow` feature flag, rolled out by user to 30% of users. It emits a
+`feature_flag.evaluation` event, and its wide event carries `feature_flag.key`, `feature_flag.result.variant`,
+`feature_flag.provider.name` and `feature_flag.result.reason`. The `treatment` variant checks stock per warehouse,
+which costs one more database query.
 
 Timestamps are simulated from the start of each interaction, so the process never sleeps inside a request.
 Span ends can be up to about a second in the future.
