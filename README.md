@@ -15,8 +15,8 @@ Each interaction is a shopper clicking "place order" in the `web` front end, whi
 web       INTERNAL  click                                    log: checkout submitted
 web       CLIENT      POST  -> checkout
 checkout  SERVER        POST /api/v1/checkout                log: checkout started
-checkout  CLIENT          GET cart                           (redis, cache.hit)
-checkout  CLIENT          SELECT shop.inventory ...          (postgresql, 2–5 queries)
+checkout  CLIENT          GET                                (redis: the cart, cache.hit)
+checkout  CLIENT          SELECT shop.inventory ...          (postgresql: 3–5 statements ending in INSERT shop.orders)
 checkout  CLIENT          POST  -> payments
 payments  SERVER            POST /api/v1/charge              log: authorizing card
 payments  CLIENT              POST  -> payment provider      log: payment gateway timed out (on error)
@@ -28,6 +28,15 @@ payments  CLIENT              POST  -> payment provider      log: payment gatewa
 - A fraction of charges (`--error-ratio`, default 25%) time out at the payment provider after ~900 ms. The payments
   server span and the calls into and out of it are marked as errors. Checkout accepts the order with payment
   pending (HTTP 202), so its server span succeeds.
+- A fraction of orders (`--db-error-ratio`, default 2%) fail at the `INSERT` with Postgres serialization failure
+  `40001`, recorded as `db.response.status_code` and `error.type`. Checkout logs the failure, returns 500 with
+  `outcome=db_error` without calling payments, and its server span is marked as an error.
+- Database and cache spans follow the
+  [database span conventions](https://opentelemetry.io/docs/specs/semconv/database/database-spans/): Postgres
+  spans carry `server.address` (an RDS host in `--region`), `server.port`, `db.namespace`, `db.collection.name`,
+  `db.operation.name`, a parameterized `db.query.text`, `db.query.summary` (also the span name) and, for SELECTs,
+  `db.response.returned_rows`. Redis spans carry `server.address`, `server.port`, the database index as
+  `db.namespace` and `db.query.text`.
 - The `web` service stands in for the OpenTelemetry JS browser SDK. Its resource has `telemetry.sdk.language`
   `webjs`, `user_agent.original`, `browser.language` and, for Chromium browsers, `browser.brands`,
   `browser.platform` and `browser.mobile`. It has no cloud or k8s attributes. The trace context reaches
@@ -79,6 +88,7 @@ docker run --rm -e OTEL_EXPORTER_OTLP_ENDPOINT=http://host.docker.internal:4317 
 |---|---|---|
 | `--rate` | `2` | checkout requests per second |
 | `--error-ratio` | `0.25` | fraction of payments that time out |
+| `--db-error-ratio` | `0.02` | fraction of orders that fail with a database serialization failure |
 | `--environment` | `local` | `deployment.environment.name` |
 | `--namespace` | `shop` | `service.namespace` and `k8s.namespace.name` |
 | `--region` | `us-east-1` | `cloud.region`; zones are `<region>a`, `b` and `c` |

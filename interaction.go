@@ -33,8 +33,10 @@ type simulator struct {
 }
 
 type simConfig struct {
-	namespace  string  // the Kubernetes namespace the services run in
-	errorRatio float64 // fraction of charges that time out at the payment gateway
+	namespace    string  // the Kubernetes namespace the services run in
+	region       string  // the cloud region, which appears in the database's host name
+	errorRatio   float64 // fraction of charges that time out at the payment gateway
+	dbErrorRatio float64 // fraction of orders whose INSERT fails with a serialization failure
 }
 
 func newSimulator(web, checkout, payments []instance, cfg simConfig, rng *rand.Rand) *simulator {
@@ -151,8 +153,11 @@ func (s *simulator) run(ctx context.Context, start time.Time) {
 	fetch.End(trace.WithTimestamp(c.advance(latency)))
 
 	severity, body := otellog.SeverityInfo, "order confirmed"
-	if res.outcome == "payment_pending" {
+	switch res.outcome {
+	case "payment_pending":
 		severity, body = otellog.SeverityWarn, "order placed with payment pending"
+	case "db_error":
+		severity, body = otellog.SeverityError, "order failed"
 	}
 	end := c.advance(s.between(5*time.Millisecond, 20*time.Millisecond))
 	wide := append(req.sessionAttrs(),
@@ -174,7 +179,8 @@ func (s *simulator) run(ctx context.Context, start time.Time) {
 // handleCheckout simulates checkout serving POST /api/v1/checkout: it reads the cart from
 // cache, runs a few database queries and calls payments. A payment gateway timeout fails the
 // payments request, and checkout accepts the order with payment pending, so its own request
-// still succeeds.
+// still succeeds. A database serialization failure fails the order with a 500 before
+// payments is called.
 func (s *simulator) handleCheckout(ctx context.Context, c *clock, req request) checkoutResult {
 	checkout := s.pick(s.checkout)
 	start := c.now
@@ -202,60 +208,127 @@ func (s *simulator) handleCheckout(ctx context.Context, c *clock, req request) c
 		attribute.String("user.id", req.userID), attribute.Int("cart.items", req.items))
 
 	cacheHit := s.rng.Float64() < 0.8
-	_, cache := checkout.tracer.Start(ctx, "GET cart", trace.WithSpanKind(trace.SpanKindClient),
+	_, cache := checkout.tracer.Start(ctx, "GET", trace.WithSpanKind(trace.SpanKindClient),
 		trace.WithTimestamp(c.now), trace.WithAttributes(
 			attribute.String("db.system.name", "redis"),
 			attribute.String("db.operation.name", "GET"),
+			attribute.String("db.namespace", "0"),
+			attribute.String("db.query.text", "GET cart:"+req.userID),
+			attribute.String("server.address", "redis."+s.namespace+".svc.cluster.local"),
+			attribute.Int("server.port", 6379),
 			attribute.Bool("cache.hit", cacheHit),
 		))
 	cache.End(trace.WithTimestamp(c.advance(s.between(time.Millisecond, 3*time.Millisecond))))
 
-	queries := 2 + s.rng.IntN(3)
-	if !cacheHit {
-		queries++
-	}
+	// A serialization failure aborts the order's transaction at the INSERT, the last statement.
+	statements := s.checkoutStatements(req, cacheHit)
+	dbFailed := s.rng.Float64() < s.dbErrorRatio
 	var dbTime time.Duration
-	for i := range queries {
-		op, table := "SELECT", "shop.inventory"
-		if i == queries-1 {
-			op, table = "INSERT", "shop.orders"
-		}
+	for i, st := range statements {
 		d := s.between(2*time.Millisecond, 12*time.Millisecond)
 		dbTime += d
-		_, q := checkout.tracer.Start(ctx, op+" "+table, trace.WithSpanKind(trace.SpanKindClient),
-			trace.WithTimestamp(c.now), trace.WithAttributes(
-				attribute.String("db.system.name", "postgresql"),
-				attribute.String("db.namespace", "shop"),
-				attribute.String("db.operation.name", op),
-				attribute.String("db.collection.name", table),
-			))
-		q.End(trace.WithTimestamp(c.advance(d)))
+		s.query(ctx, checkout, c, st, d, dbFailed && i == len(statements)-1)
 	}
 
-	paid, errorType := s.charge(ctx, checkout, c, req)
+	var res checkoutResult
+	if dbFailed {
+		s.log(ctx, checkout, c.advance(time.Millisecond), otellog.SeverityError, "placing order failed",
+			attribute.String("error.type", serializationFailure), attribute.String("db.response.status_code", serializationFailure))
+		res = checkoutResult{status: 500, outcome: "db_error", errorType: serializationFailure}
+	} else if paid, errorType := s.charge(ctx, checkout, c, req); paid {
+		res = checkoutResult{status: 200, outcome: "success"}
+	} else {
+		res = checkoutResult{status: 202, outcome: "payment_pending", errorType: errorType}
+	}
 
-	outcome, status, severity, body := "success", 200, otellog.SeverityInfo, "checkout completed"
-	if !paid {
-		outcome, status, severity, body = "payment_pending", 202, otellog.SeverityWarn, "checkout accepted with payment pending"
+	severity, body := otellog.SeverityInfo, "checkout completed"
+	switch res.outcome {
+	case "payment_pending":
+		severity, body = otellog.SeverityWarn, "checkout accepted with payment pending"
+	case "db_error":
+		severity, body = otellog.SeverityError, "checkout failed"
 	}
 	end := c.advance(s.between(time.Millisecond, 4*time.Millisecond))
 	wide := append(requestAttrs,
-		attribute.Int("http.response.status_code", status),
+		attribute.Int("http.response.status_code", res.status),
 		attribute.Int("http.response.body.size", 280+s.rng.IntN(40)),
 		attribute.Float64("duration_ms", millis(end.Sub(start))),
-		attribute.Int("db.query_count", queries),
+		attribute.Int("db.query_count", len(statements)),
 		attribute.Float64("db.duration_ms", millis(dbTime)),
 		attribute.Bool("cache.hit", cacheHit),
-		attribute.String("outcome", outcome),
+		attribute.String("outcome", res.outcome),
 	)
-	if errorType != "" {
-		wide = append(wide, attribute.String("error.type", errorType))
+	if res.errorType != "" {
+		wide = append(wide, attribute.String("error.type", res.errorType))
 	}
 	// Server span status stays unset below 500: a 202 is a success for checkout.
+	if res.status >= 500 {
+		root.SetStatus(codes.Error, "")
+	}
 	root.SetAttributes(wide...)
 	s.log(ctx, checkout, end, severity, body, append(wide, attribute.Bool("main", true))...)
 	root.End(trace.WithTimestamp(end))
-	return checkoutResult{status: status, outcome: outcome, errorType: errorType}
+	return res
+}
+
+// serializationFailure is the SQLSTATE Postgres returns when a transaction conflicts with a
+// concurrent one.
+const serializationFailure = "40001"
+
+// statement is one SQL statement checkout sends to Postgres.
+type statement struct {
+	op, table, text string
+	rows            int // rows returned by a SELECT
+}
+
+// summary is the low-cardinality db.query.summary, which is also the span name.
+func (st statement) summary() string {
+	return st.op + " " + st.table
+}
+
+// checkoutStatements are the statements of one checkout: on a cache miss the cart is loaded
+// from the database, stock is locked, prices and any promotion are read, and the order is
+// inserted.
+func (s *simulator) checkoutStatements(req request, cacheHit bool) []statement {
+	var sts []statement
+	if !cacheHit {
+		sts = append(sts, statement{"SELECT", "shop.carts", "SELECT sku, qty FROM shop.carts WHERE user_id = $1", req.items})
+	}
+	sts = append(sts,
+		statement{"SELECT", "shop.inventory", "SELECT sku, qty FROM shop.inventory WHERE sku = ANY($1) FOR UPDATE", req.items},
+		statement{"SELECT", "shop.prices", "SELECT sku, price FROM shop.prices WHERE sku = ANY($1)", req.items},
+	)
+	if s.rng.IntN(2) == 0 {
+		sts = append(sts, statement{"SELECT", "shop.promotions", "SELECT discount FROM shop.promotions WHERE code = $1 AND expires_at > now()", s.rng.IntN(2)})
+	}
+	return append(sts, statement{"INSERT", "shop.orders", "INSERT INTO shop.orders (id, user_id, team_id, total) VALUES ($1, $2, $3, $4)", 0})
+}
+
+// query records one statement as a Postgres client span lasting d.
+func (s *simulator) query(ctx context.Context, inst instance, c *clock, st statement, d time.Duration, fail bool) {
+	attrs := []attribute.KeyValue{
+		attribute.String("db.system.name", "postgresql"),
+		attribute.String("db.namespace", "shop"),
+		attribute.String("db.operation.name", st.op),
+		attribute.String("db.collection.name", st.table),
+		attribute.String("db.query.text", st.text),
+		attribute.String("db.query.summary", st.summary()),
+		attribute.String("server.address", s.namespace+"-db.cluster-c8x2k4mbq7n1."+s.region+".rds.amazonaws.com"),
+		attribute.Int("server.port", 5432),
+	}
+	if st.op == "SELECT" && !fail {
+		attrs = append(attrs, attribute.Int("db.response.returned_rows", st.rows))
+	}
+	_, span := inst.tracer.Start(ctx, st.summary(), trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithTimestamp(c.now), trace.WithAttributes(attrs...))
+	if fail {
+		span.SetAttributes(
+			attribute.String("db.response.status_code", serializationFailure),
+			attribute.String("error.type", serializationFailure),
+		)
+		span.SetStatus(codes.Error, "could not serialize access due to concurrent update")
+	}
+	span.End(trace.WithTimestamp(c.advance(d)))
 }
 
 // paymentProvider is an external payment API that payments charges cards through.

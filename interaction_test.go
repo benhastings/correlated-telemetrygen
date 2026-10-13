@@ -33,7 +33,12 @@ func (r *logRecorder) OnEmit(_ context.Context, rec *sdklog.Record) error {
 	return nil
 }
 
-var testDeployment = deployment{environment: "test", namespace: "shop", region: "us-east-1"}
+var (
+	testDeployment = deployment{environment: "test", namespace: "shop", region: "us-east-1"}
+	testConfig     = simConfig{namespace: "shop", region: "us-east-1", errorRatio: 0.25, dbErrorRatio: 0.02}
+	// withoutDBErrors is for tests that count spans: a database failure skips the payments call.
+	withoutDBErrors = simConfig{namespace: "shop", region: "us-east-1", errorRatio: 0.25}
+)
 
 func recordingFleet(t *testing.T, replicas []replica, spans *tracetest.SpanRecorder, logs *logRecorder) []instance {
 	t.Helper()
@@ -47,7 +52,7 @@ func recordingFleet(t *testing.T, replicas []replica, spans *tracetest.SpanRecor
 	return fleet
 }
 
-func simulate(t *testing.T, n int, errorRatio float64) ([]sdktrace.ReadOnlySpan, []sdklog.Record) {
+func simulate(t *testing.T, n int, cfg simConfig) ([]sdktrace.ReadOnlySpan, []sdklog.Record) {
 	t.Helper()
 	spans := tracetest.NewSpanRecorder()
 	logs := &logRecorder{}
@@ -56,7 +61,7 @@ func simulate(t *testing.T, n int, errorRatio float64) ([]sdktrace.ReadOnlySpan,
 		recordingFleet(t, browserResources(testDeployment), spans, logs),
 		recordingFleet(t, replicaResources(checkoutIdentity, testDeployment, rng), spans, logs),
 		recordingFleet(t, replicaResources(paymentsIdentity, testDeployment, rng), spans, logs),
-		simConfig{namespace: testDeployment.namespace, errorRatio: errorRatio}, rng,
+		cfg, rng,
 	)
 	start := time.Unix(1_700_000_000, 0)
 	for i := range n {
@@ -88,7 +93,7 @@ func attr(rec sdklog.Record, key string) (attribute.Value, bool) {
 }
 
 func TestEveryLogBelongsToASpanOfTheSameServiceAndTrace(t *testing.T) {
-	spans, logs := simulate(t, 50, 0.25)
+	spans, logs := simulate(t, 50, testConfig)
 	if len(logs) == 0 {
 		t.Fatal("no logs emitted")
 	}
@@ -120,7 +125,7 @@ func TestEveryLogBelongsToASpanOfTheSameServiceAndTrace(t *testing.T) {
 }
 
 func TestPaymentsServerSpanIsAChildOfCheckoutsClientCall(t *testing.T) {
-	spans, _ := simulate(t, 10, 0.25)
+	spans, _ := simulate(t, 10, withoutDBErrors)
 	byID := map[trace.SpanID]sdktrace.ReadOnlySpan{}
 	for _, s := range spans {
 		byID[s.SpanContext().SpanID()] = s
@@ -148,7 +153,7 @@ func isWideEvent(rec sdklog.Record) bool {
 
 func TestEachServiceEmitsOneWideEventPerRequest(t *testing.T) {
 	const n = 20
-	_, logs := simulate(t, n, 0.25)
+	_, logs := simulate(t, n, withoutDBErrors)
 	perService := map[string]int{}
 	for _, rec := range logs {
 		if !isWideEvent(rec) {
@@ -172,7 +177,7 @@ func TestEachServiceEmitsOneWideEventPerRequest(t *testing.T) {
 }
 
 func TestCheckoutServerSpanIsAChildOfTheBrowsersFetch(t *testing.T) {
-	spans, _ := simulate(t, 10, 0.25)
+	spans, _ := simulate(t, 10, testConfig)
 	byID := map[trace.SpanID]sdktrace.ReadOnlySpan{}
 	for _, s := range spans {
 		byID[s.SpanContext().SpanID()] = s
@@ -198,7 +203,7 @@ func TestCheckoutServerSpanIsAChildOfTheBrowsersFetch(t *testing.T) {
 }
 
 func TestWideEventsOfOneRequestShareTheSessionAndUser(t *testing.T) {
-	_, logs := simulate(t, 200, 0.25)
+	_, logs := simulate(t, 200, testConfig)
 	type who struct{ session, user, team string }
 	perTrace := map[trace.TraceID]who{}
 	sessionsPerUser := map[string]map[string]bool{}
@@ -251,7 +256,7 @@ func TestBrowserResourcesDescribeTheBrowserNotTheServer(t *testing.T) {
 }
 
 func TestPaymentErrorsStayOutOfCheckoutsServerSpan(t *testing.T) {
-	spans, _ := simulate(t, 400, 0.25)
+	spans, _ := simulate(t, 400, withoutDBErrors)
 	var payments, paymentErrors int
 	for _, s := range spans {
 		if s.SpanKind() != trace.SpanKindServer {
@@ -312,7 +317,7 @@ func TestReplicasAreDistinctPodsSpreadAcrossZones(t *testing.T) {
 }
 
 func TestRequestsSpreadAcrossReplicasAndStayOnOne(t *testing.T) {
-	spans, logs := simulate(t, 100, 0.25)
+	spans, logs := simulate(t, 100, testConfig)
 	perService := map[string]map[string]bool{}
 	perTrace := map[string]string{}
 	note := func(res *resource.Resource, traceID trace.TraceID) {
@@ -350,7 +355,7 @@ func spanAttr(s sdktrace.ReadOnlySpan, key attribute.Key) (attribute.Value, bool
 }
 
 func TestHTTPSpansHaveTheAttributesSemconvRequires(t *testing.T) {
-	spans, _ := simulate(t, 100, 0.25)
+	spans, _ := simulate(t, 100, withoutDBErrors)
 	clients := 0
 	for _, s := range spans {
 		if _, ok := spanAttr(s, "peer.service"); ok {
@@ -381,7 +386,7 @@ func TestHTTPSpansHaveTheAttributesSemconvRequires(t *testing.T) {
 }
 
 func TestPeerAddressesIdentifyTheReplicaOnTheOtherEnd(t *testing.T) {
-	spans, _ := simulate(t, 100, 0.25)
+	spans, _ := simulate(t, 100, testConfig)
 	byID := map[trace.SpanID]sdktrace.ReadOnlySpan{}
 	for _, s := range spans {
 		byID[s.SpanContext().SpanID()] = s
@@ -413,5 +418,77 @@ func TestPeerAddressesIdentifyTheReplicaOnTheOtherEnd(t *testing.T) {
 	}
 	if len(podToAddr) != checkoutIdentity.replicas+paymentsIdentity.replicas {
 		t.Fatalf("saw addresses for %d pods, want %d", len(podToAddr), checkoutIdentity.replicas+paymentsIdentity.replicas)
+	}
+}
+
+func TestDatabaseSpansSayWhereAndWhat(t *testing.T) {
+	spans, _ := simulate(t, 100, testConfig)
+	var postgres, redis int
+	for _, s := range spans {
+		system, ok := spanAttr(s, "db.system.name")
+		if !ok {
+			continue
+		}
+		required := []attribute.Key{"server.address", "server.port", "db.operation.name", "db.query.text", "db.namespace"}
+		switch system.AsString() {
+		case "postgresql":
+			postgres++
+			required = append(required, "db.query.summary", "db.collection.name")
+			if summary, _ := spanAttr(s, "db.query.summary"); summary.AsString() != s.Name() {
+				t.Fatalf("postgres span is named %q but its db.query.summary is %q", s.Name(), summary.AsString())
+			}
+		case "redis":
+			redis++
+		}
+		for _, key := range required {
+			if _, ok := spanAttr(s, key); !ok {
+				t.Fatalf("%s span %q is missing %s", system.AsString(), s.Name(), key)
+			}
+		}
+	}
+	if redis != 100 || postgres < 300 {
+		t.Fatalf("got %d redis and %d postgres spans for 100 checkouts", redis, postgres)
+	}
+}
+
+func TestDatabaseFailuresFailTheOrderBeforePayment(t *testing.T) {
+	cfg := testConfig
+	cfg.dbErrorRatio = 0.1
+	spans, logs := simulate(t, 500, cfg)
+	failed := map[trace.TraceID]bool{}
+	for _, s := range spans {
+		if s.Name() == "INSERT shop.orders" && s.Status().Code == codes.Error {
+			if code, _ := spanAttr(s, "db.response.status_code"); code.AsString() != serializationFailure {
+				t.Fatalf("failed INSERT has db.response.status_code %q", code.AsString())
+			}
+			failed[s.SpanContext().TraceID()] = true
+		}
+	}
+	if ratio := float64(len(failed)) / 500; ratio < 0.06 || ratio > 0.14 {
+		t.Fatalf("database failure ratio %.2f, want about 0.1", ratio)
+	}
+	for _, s := range spans {
+		if !failed[s.SpanContext().TraceID()] {
+			continue
+		}
+		svc := serviceOf(s.Resource())
+		if svc == "payments" {
+			t.Fatal("payments was called for an order whose INSERT failed")
+		}
+		if svc == "checkout" && s.SpanKind() == trace.SpanKindServer && s.Status().Code != codes.Error {
+			t.Fatal("checkout server span of a failed order is not an error")
+		}
+	}
+	for _, rec := range logs {
+		if !isWideEvent(rec) || !failed[rec.TraceID()] {
+			continue
+		}
+		outcome, _ := attr(rec, "outcome")
+		status, _ := attr(rec, "http.response.status_code")
+		errorType, _ := attr(rec, "error.type")
+		if outcome.AsString() != "db_error" || status.AsInt64() != 500 || errorType.AsString() != serializationFailure {
+			t.Fatalf("%s wide event of a failed order: outcome=%s status=%d error.type=%s",
+				serviceOf(rec.Resource()), outcome.AsString(), status.AsInt64(), errorType.AsString())
+		}
 	}
 }
