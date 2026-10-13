@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"math/rand/v2"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -34,10 +35,10 @@ func (r *logRecorder) OnEmit(_ context.Context, rec *sdklog.Record) error {
 
 var testDeployment = deployment{environment: "test", namespace: "shop", region: "us-east-1"}
 
-func recordingFleet(t *testing.T, id serviceIdentity, rng *rand.Rand, spans *tracetest.SpanRecorder, logs *logRecorder) []instance {
+func recordingFleet(t *testing.T, resources [][]attribute.KeyValue, spans *tracetest.SpanRecorder, logs *logRecorder) []instance {
 	t.Helper()
 	var fleet []instance
-	for _, attrs := range replicaResources(id, testDeployment, rng) {
+	for _, attrs := range resources {
 		res := resource.NewSchemaless(attrs...)
 		tp := sdktrace.NewTracerProvider(sdktrace.WithResource(res), sdktrace.WithSpanProcessor(spans))
 		lp := sdklog.NewLoggerProvider(sdklog.WithResource(res), sdklog.WithProcessor(logs))
@@ -51,12 +52,12 @@ func simulate(t *testing.T, n int, errorRatio float64) ([]sdktrace.ReadOnlySpan,
 	spans := tracetest.NewSpanRecorder()
 	logs := &logRecorder{}
 	rng := rand.New(rand.NewPCG(1, 2))
-	sim := &simulator{
-		checkout:   recordingFleet(t, checkoutIdentity, rng, spans, logs),
-		payments:   recordingFleet(t, paymentsIdentity, rng, spans, logs),
-		errorRatio: errorRatio,
-		rng:        rng,
-	}
+	sim := newSimulator(
+		recordingFleet(t, browserResources(testDeployment), spans, logs),
+		recordingFleet(t, replicaResources(checkoutIdentity, testDeployment, rng), spans, logs),
+		recordingFleet(t, replicaResources(paymentsIdentity, testDeployment, rng), spans, logs),
+		errorRatio, rng,
+	)
 	start := time.Unix(1_700_000_000, 0)
 	for i := range n {
 		sim.run(context.Background(), start.Add(time.Duration(i)*time.Second))
@@ -140,23 +141,112 @@ func TestPaymentsServerSpanIsAChildOfCheckoutsClientCall(t *testing.T) {
 	}
 }
 
+func isWideEvent(rec sdklog.Record) bool {
+	v, ok := attr(rec, "main")
+	return ok && v.AsBool()
+}
+
 func TestEachServiceEmitsOneWideEventPerRequest(t *testing.T) {
 	const n = 20
 	_, logs := simulate(t, n, 0.25)
 	perService := map[string]int{}
 	for _, rec := range logs {
-		if v, ok := attr(rec, "main"); !ok || !v.AsBool() {
+		if !isWideEvent(rec) {
 			continue
 		}
-		perService[serviceOf(rec.Resource())]++
-		for _, key := range []string{"http.route", "http.response.status_code", "duration_ms", "user.id", "user.team.id", "db.query_count", "cache.hit", "outcome"} {
+		svc := serviceOf(rec.Resource())
+		perService[svc]++
+		keys := []string{"http.response.status_code", "duration_ms", "user.id", "user.team.id", "session.id", "outcome"}
+		if svc != "web" {
+			keys = append(keys, "http.route", "db.query_count", "cache.hit")
+		}
+		for _, key := range keys {
 			if _, ok := attr(rec, key); !ok {
-				t.Fatalf("%s wide event is missing %s", serviceOf(rec.Resource()), key)
+				t.Fatalf("%s wide event is missing %s", svc, key)
 			}
 		}
 	}
-	if perService["checkout"] != n || perService["payments"] != n {
+	if perService["web"] != n || perService["checkout"] != n || perService["payments"] != n {
 		t.Fatalf("wide events per service = %v, want %d each", perService, n)
+	}
+}
+
+func TestCheckoutServerSpanIsAChildOfTheBrowsersFetch(t *testing.T) {
+	spans, _ := simulate(t, 10, 0.25)
+	byID := map[trace.SpanID]sdktrace.ReadOnlySpan{}
+	for _, s := range spans {
+		byID[s.SpanContext().SpanID()] = s
+	}
+	found := 0
+	for _, s := range spans {
+		if serviceOf(s.Resource()) != "checkout" || s.SpanKind() != trace.SpanKindServer {
+			continue
+		}
+		found++
+		parent, ok := byID[s.Parent().SpanID()]
+		if !ok || serviceOf(parent.Resource()) != "web" || parent.SpanKind() != trace.SpanKindClient {
+			t.Fatalf("checkout server span's parent is not a web client span")
+		}
+		if parent.StartTime().After(s.StartTime()) || parent.EndTime().Before(s.EndTime()) {
+			t.Fatalf("the browser's fetch [%s, %s] does not contain the checkout server span [%s, %s]",
+				parent.StartTime(), parent.EndTime(), s.StartTime(), s.EndTime())
+		}
+	}
+	if found != 10 {
+		t.Fatalf("got %d checkout server spans, want 10", found)
+	}
+}
+
+func TestWideEventsOfOneRequestShareTheSessionAndUser(t *testing.T) {
+	_, logs := simulate(t, 200, 0.25)
+	type who struct{ session, user, team string }
+	perTrace := map[trace.TraceID]who{}
+	sessionsPerUser := map[string]map[string]bool{}
+	for _, rec := range logs {
+		if !isWideEvent(rec) {
+			continue
+		}
+		sess, _ := attr(rec, "session.id")
+		user, _ := attr(rec, "user.id")
+		team, _ := attr(rec, "user.team.id")
+		w := who{sess.AsString(), user.AsString(), team.AsString()}
+		if prev, ok := perTrace[rec.TraceID()]; ok && prev != w {
+			t.Fatalf("wide events of one request disagree: %+v and %+v", prev, w)
+		}
+		perTrace[rec.TraceID()] = w
+		if sessionsPerUser[w.user] == nil {
+			sessionsPerUser[w.user] = map[string]bool{}
+		}
+		sessionsPerUser[w.user][w.session] = true
+	}
+	teams := map[string]string{}
+	for _, w := range perTrace {
+		if prev, ok := teams[w.user]; ok && prev != w.team {
+			t.Fatalf("user %s belongs to teams %s and %s", w.user, prev, w.team)
+		}
+		teams[w.user] = w.team
+	}
+	if len(sessionsPerUser) == len(perTrace) {
+		t.Fatal("no user checked out twice, so sessions were never reused")
+	}
+}
+
+func TestBrowserResourcesDescribeTheBrowserNotTheServer(t *testing.T) {
+	for _, attrs := range browserResources(testDeployment) {
+		res := resource.NewSchemaless(attrs...)
+		if got := resourceAttr(res, "telemetry.sdk.language"); got != "webjs" {
+			t.Fatalf("web telemetry.sdk.language = %q, want webjs", got)
+		}
+		for _, key := range []attribute.Key{"service.instance.id", "cloud.region", "k8s.pod.name"} {
+			if v := resourceAttr(res, key); v != "" {
+				t.Fatalf("browser resource has %s=%s", key, v)
+			}
+		}
+		ua := resourceAttr(res, "user_agent.original")
+		hasBrands := resourceAttr(res, "browser.brands") != ""
+		if chromium := strings.Contains(ua, "Chrome/"); chromium != hasBrands {
+			t.Fatalf("browser.brands should be set exactly for Chromium browsers, got brands=%v for %s", hasBrands, ua)
+		}
 	}
 }
 
