@@ -12,9 +12,9 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
-// service is one simulated service: the tracer and logger share a resource, so its spans and
-// logs carry the same service.name, service.namespace, service.version and so on.
-type service struct {
+// instance is one replica of a simulated service: the tracer and logger share a resource, so
+// its spans and logs carry the same service.name, service.instance.id, k8s.pod.name and so on.
+type instance struct {
 	tracer trace.Tracer
 	logger otellog.Logger
 }
@@ -22,8 +22,8 @@ type service struct {
 // simulator emits one checkout interaction at a time. Time is simulated: spans and logs get
 // explicit timestamps laid out from the start of the interaction, so nothing sleeps.
 type simulator struct {
-	checkout   service
-	payments   service
+	checkout   []instance
+	payments   []instance
 	errorRatio float64
 	rng        *rand.Rand
 }
@@ -38,6 +38,11 @@ func (c *clock) advance(d time.Duration) time.Time {
 	return c.now
 }
 
+// pick chooses the replica that serves a request, as a load balancer would.
+func (s *simulator) pick(fleet []instance) instance {
+	return fleet[s.rng.IntN(len(fleet))]
+}
+
 func (s *simulator) between(lo, hi time.Duration) time.Duration {
 	return lo + time.Duration(s.rng.Int64N(int64(hi-lo)+1))
 }
@@ -47,10 +52,11 @@ func (s *simulator) between(lo, hi time.Duration) time.Duration {
 // checkout accepts the order with payment pending, so its own request still succeeds.
 func (s *simulator) run(ctx context.Context, start time.Time) {
 	c := &clock{now: start}
+	checkout := s.pick(s.checkout)
 	userID := fmt.Sprintf("usr_%05d", s.rng.IntN(500))
 	tenant := tenants[s.rng.IntN(len(tenants))]
 
-	ctx, root := s.checkout.tracer.Start(ctx, "POST /api/v1/checkout",
+	ctx, root := checkout.tracer.Start(ctx, "POST /api/v1/checkout",
 		trace.WithSpanKind(trace.SpanKindServer), trace.WithTimestamp(start),
 		trace.WithAttributes(
 			attribute.String("http.request.method", "POST"),
@@ -59,11 +65,11 @@ func (s *simulator) run(ctx context.Context, start time.Time) {
 			attribute.String("user.team.id", tenant),
 		))
 	items := 1 + s.rng.IntN(5)
-	s.log(ctx, s.checkout, c.advance(time.Millisecond), otellog.SeverityInfo, "checkout started",
+	s.log(ctx, checkout, c.advance(time.Millisecond), otellog.SeverityInfo, "checkout started",
 		attribute.String("user.id", userID), attribute.Int("cart.items", items))
 
 	cacheHit := s.rng.Float64() < 0.8
-	_, cache := s.checkout.tracer.Start(ctx, "GET cart", trace.WithSpanKind(trace.SpanKindClient),
+	_, cache := checkout.tracer.Start(ctx, "GET cart", trace.WithSpanKind(trace.SpanKindClient),
 		trace.WithTimestamp(c.now), trace.WithAttributes(
 			attribute.String("db.system.name", "redis"),
 			attribute.String("db.operation.name", "GET"),
@@ -83,7 +89,7 @@ func (s *simulator) run(ctx context.Context, start time.Time) {
 		}
 		d := s.between(2*time.Millisecond, 12*time.Millisecond)
 		dbTime += d
-		_, q := s.checkout.tracer.Start(ctx, op+" "+table, trace.WithSpanKind(trace.SpanKindClient),
+		_, q := checkout.tracer.Start(ctx, op+" "+table, trace.WithSpanKind(trace.SpanKindClient),
 			trace.WithTimestamp(c.now), trace.WithAttributes(
 				attribute.String("db.system.name", "postgresql"),
 				attribute.String("db.namespace", "shop"),
@@ -93,7 +99,7 @@ func (s *simulator) run(ctx context.Context, start time.Time) {
 		q.End(trace.WithTimestamp(c.advance(d)))
 	}
 
-	paid, errorType := s.charge(ctx, c, userID, tenant, items)
+	paid, errorType := s.charge(ctx, checkout, c, userID, tenant, items)
 
 	outcome, status, severity, body := "success", 200, otellog.SeverityInfo, "checkout completed"
 	if !paid {
@@ -117,16 +123,17 @@ func (s *simulator) run(ctx context.Context, start time.Time) {
 	}
 	root.SetAttributes(wide...)
 	root.SetStatus(codes.Ok, "")
-	s.log(ctx, s.checkout, end, severity, body, append(wide, attribute.Bool("main", true))...)
+	s.log(ctx, checkout, end, severity, body, append(wide, attribute.Bool("main", true))...)
 	root.End(trace.WithTimestamp(end))
 }
 
 // charge is checkout's call to payments: a client span in checkout and, under it, the
 // payments server span with its own gateway call and logs. It reports whether the charge
 // succeeded and, if not, the error type.
-func (s *simulator) charge(ctx context.Context, c *clock, userID, tenant string, items int) (bool, string) {
+func (s *simulator) charge(ctx context.Context, checkout instance, c *clock, userID, tenant string, items int) (bool, string) {
 	fail := s.rng.Float64() < s.errorRatio
-	ctx, call := s.checkout.tracer.Start(ctx, "POST", trace.WithSpanKind(trace.SpanKindClient),
+	payments := s.pick(s.payments)
+	ctx, call := checkout.tracer.Start(ctx, "POST", trace.WithSpanKind(trace.SpanKindClient),
 		trace.WithTimestamp(c.now), trace.WithAttributes(
 			attribute.String("http.request.method", "POST"),
 			attribute.String("server.address", "payments"),
@@ -135,7 +142,7 @@ func (s *simulator) charge(ctx context.Context, c *clock, userID, tenant string,
 		))
 	start := c.advance(time.Millisecond)
 
-	pctx, srv := s.payments.tracer.Start(ctx, "POST /api/v1/charge",
+	pctx, srv := payments.tracer.Start(ctx, "POST /api/v1/charge",
 		trace.WithSpanKind(trace.SpanKindServer), trace.WithTimestamp(start),
 		trace.WithAttributes(
 			attribute.String("http.request.method", "POST"),
@@ -144,10 +151,10 @@ func (s *simulator) charge(ctx context.Context, c *clock, userID, tenant string,
 			attribute.String("user.team.id", tenant),
 		))
 	amount := float64(items) * (5 + float64(s.rng.IntN(9500))/100)
-	s.log(pctx, s.payments, c.advance(time.Millisecond), otellog.SeverityInfo, "authorizing card",
+	s.log(pctx, payments, c.advance(time.Millisecond), otellog.SeverityInfo, "authorizing card",
 		attribute.Float64("payment.amount", amount), attribute.String("payment.currency", "USD"))
 
-	_, gw := s.payments.tracer.Start(pctx, "POST", trace.WithSpanKind(trace.SpanKindClient),
+	_, gw := payments.tracer.Start(pctx, "POST", trace.WithSpanKind(trace.SpanKindClient),
 		trace.WithTimestamp(c.now), trace.WithAttributes(
 			attribute.String("http.request.method", "POST"),
 			attribute.String("server.address", "gateway.example.com"),
@@ -160,7 +167,7 @@ func (s *simulator) charge(ctx context.Context, c *clock, userID, tenant string,
 		gw.SetStatus(codes.Error, "gateway timeout")
 		gw.End(trace.WithTimestamp(gwEnd))
 		status, outcome, errorType = 504, "upstream_error", "GatewayTimeout"
-		s.log(pctx, s.payments, c.advance(time.Millisecond), otellog.SeverityError, "payment gateway timed out",
+		s.log(pctx, payments, c.advance(time.Millisecond), otellog.SeverityError, "payment gateway timed out",
 			attribute.String("error.type", errorType), attribute.Float64("payment.amount", amount))
 	} else {
 		gw.End(trace.WithTimestamp(c.advance(s.between(30*time.Millisecond, 110*time.Millisecond))))
@@ -185,7 +192,7 @@ func (s *simulator) charge(ctx context.Context, c *clock, userID, tenant string,
 		severity, body = otellog.SeverityError, "charge failed"
 	}
 	srv.SetAttributes(wide...)
-	s.log(pctx, s.payments, end, severity, body, append(wide, attribute.Bool("main", true))...)
+	s.log(pctx, payments, end, severity, body, append(wide, attribute.Bool("main", true))...)
 	srv.End(trace.WithTimestamp(end))
 
 	callEnd := c.advance(time.Millisecond)
@@ -201,7 +208,7 @@ func (s *simulator) charge(ctx context.Context, c *clock, userID, tenant string,
 // log emits a record inside the span in ctx. The SDK copies the span's trace and span IDs onto
 // the record; they are repeated as trace_id and span_id attributes so a log backend can link
 // to the trace from the attributes alone.
-func (s *simulator) log(ctx context.Context, svc service, ts time.Time, sev otellog.Severity, body string, attrs ...attribute.KeyValue) {
+func (s *simulator) log(ctx context.Context, svc instance, ts time.Time, sev otellog.Severity, body string, attrs ...attribute.KeyValue) {
 	sc := trace.SpanContextFromContext(ctx)
 	var r otellog.Record
 	r.SetTimestamp(ts)
